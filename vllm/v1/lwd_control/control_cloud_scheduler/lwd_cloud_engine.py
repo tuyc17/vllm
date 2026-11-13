@@ -183,7 +183,28 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         self._lwd_ingest_thread.start()
         plane = self._lwd_start_control_plane()
+        self._lwd_init_obf_detokenizer()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+
+    def _lwd_init_obf_detokenizer(self) -> None:
+        """Load the obfuscated tokenizer snapshot when the demo block is set.
+
+        The cloud loads the runtime artifact only (no private permutation);
+        a missing artifact or package fails startup instead of failing per
+        request.
+        """
+        obfuscation = self.lwd_config.obfuscation
+        if obfuscation is None:
+            return
+        from vllm.v1.lwd_control.lwd_obfuscation import LwdCloudObfDetokenizer
+
+        self.scheduler.lwd_obf_detokenizer = LwdCloudObfDetokenizer.from_config(
+            obfuscation
+        )
+        lwd_logger.info(
+            "[LWD][obf] cloud obfuscated tokenizer loaded from %s",
+            obfuscation.artifact_dir,
+        )
 
     def _lwd_dp_coordinator_addr(self) -> str:
         """Routable coordinator stats endpoint, or empty without one."""

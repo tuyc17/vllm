@@ -238,6 +238,12 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     edge skips sampling."""
     prefix_nonces: list[int] = []
     """Generation of each request row, aligned with req_ids."""
+    obf_texts: list[str] = []
+    """Obfuscation demo: per-request obfuscated detokenized text (PUA
+    carrier, one char per mixed byte) of this step's token ids, aligned
+    with req_ids; produced by the cloud only under lwd_config.obfuscation
+    with DISABLE_DOWN. The trusted edge restores it to plaintext; the
+    cloud holds no permutation, so the carrier is opaque to it."""
 
 
 LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify

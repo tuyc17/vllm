@@ -43,6 +43,7 @@ from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.lwd_control.lwd_obfuscation import LwdCloudObfDetokenizer
     from vllm.v1.outputs import ModelRunnerOutput
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
@@ -88,6 +89,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
+        # Obfuscation demo handle; injected by the engine when
+        # lwd_config.obfuscation is set, None keeps the notify carrier-free.
+        self.lwd_obf_detokenizer: LwdCloudObfDetokenizer | None = None
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -476,8 +480,37 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 down_seqno=-1,
                 token_ids=[rows[request_id] for request_id in request_ids],
                 prefix_nonces=self._lwd_c2e_prefix_nonces(request_ids, nonce_snapshot),
+                obf_texts=self._lwd_obf_carrier_texts(request_ids, rows),
             )
         )
+
+    def _lwd_obf_carrier_texts(
+        self, request_ids: list[str], rows: dict[str, list[int]]
+    ) -> list[str]:
+        """Obfuscated detokenization of the passthrough rows (demo): the
+        cloud only runs it with the obfuscation detokenizer attached; a
+        decode failure logs and pads empty so the edge verification fails
+        visibly instead of the engine dying."""
+        detokenizer = self.lwd_obf_detokenizer
+        if detokenizer is None:
+            return []
+        texts: list[str] = []
+        for request_id in request_ids:
+            token_ids = rows.get(request_id, [])
+            if not token_ids:
+                texts.append("")
+                continue
+            try:
+                texts.append(detokenizer.obf_carrier_text(token_ids))
+            except ValueError as exc:
+                lwd_logger.error(
+                    "[LWD][obf] req=%s obfuscated decode failed (%s); "
+                    "verification will fail",
+                    request_id,
+                    exc,
+                )
+                texts.append("")
+        return texts
 
     @staticmethod
     def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:

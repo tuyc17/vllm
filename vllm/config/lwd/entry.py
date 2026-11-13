@@ -6,10 +6,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
+from .obfuscation import LwdObfuscationConfig, LwdObfuscationEntry
 from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
 
 
@@ -18,6 +19,7 @@ class _LwdEntry(TypedDict):
     path: LwdString
     role: Literal["edge", "cloud"]
     instance_id: LwdId
+    obfuscation: NotRequired[LwdObfuscationEntry]
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ class LwdConfig:
     topology: LwdTopology
     coordination: LwdCoordinationConfig | None = None
     api: LwdAPIConfig = field(default_factory=LwdAPIConfig)
+    obfuscation: LwdObfuscationConfig | None = None
 
     def __post_init__(self) -> None:
         self.api.validate_topology(self)
@@ -62,6 +65,7 @@ class LwdConfig:
             topology,
             coordination,
             api=api if api is not None else LwdAPIConfig(),
+            obfuscation=LwdObfuscationConfig.from_dict(entry.get("obfuscation")),
         )
 
     @property

@@ -8,12 +8,14 @@ from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .logging import log_lwd_config
+from .obfuscation import LwdObfuscationConfig
 from .topology import LwdTopology
 
 __all__ = [
     "LwdAPIConfig",
     "LwdConfig",
     "LwdCoordinationConfig",
+    "LwdObfuscationConfig",
     "LwdTopology",
     "log_lwd_config",
     "resolve_lwd_config",

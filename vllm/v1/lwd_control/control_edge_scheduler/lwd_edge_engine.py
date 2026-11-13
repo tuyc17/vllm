@@ -115,6 +115,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         }
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
+        self._lwd_init_obf_verifier()
         self.is_pooling_model = True
         self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
@@ -125,6 +126,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             "stepping depth=%d",
             len(self._lwd_clouds),
             self.batch_queue_size,
+        )
+
+    def _lwd_init_obf_verifier(self) -> None:
+        """Load the trusted obfuscation verifier when the demo block is set.
+
+        The edge is the trusted endpoint: it loads the runtime artifact
+        plus the private permutation table (binding-checked against the
+        artifact's public commitment) and keeps the native tokenizer for
+        the ground-truth side of the comparison.
+        """
+        obfuscation = self.lwd_config.obfuscation
+        if obfuscation is None:
+            return
+        from vllm.v1.lwd_control.lwd_obfuscation import LwdEdgeObfVerifier
+
+        self.scheduler.lwd_obf_verifier = LwdEdgeObfVerifier.from_config(
+            obfuscation, self.vllm_config.model_config
+        )
+        lwd_logger.info(
+            "[LWD][obf] edge verifier loaded from %s (report=%s)",
+            obfuscation.artifact_dir,
+            obfuscation.report_path or "log only",
         )
 
     def _lwd_configure_prefix_cache(self) -> None:

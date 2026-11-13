@@ -1,0 +1,64 @@
+@startuml lwd_obf_demo
+title LWD 边云协同 · tokenizer 层混淆验证 Demo（DISABLE_DOWN=1 + lwd_config.obfuscation）
+
+skinparam responseMessageBelowArrow true
+autonumber "<b>0."
+
+box "边侧 (trusted, 原生 tokenizer + 私有 π⁻¹ 表)" #E8F4FF
+participant "Client\n(lwd_obf_demo.py)" as C
+participant "边前端\nAPI/Detokenizer\n(原生 tokenizer)" as FE
+participant "边引擎\nLwdEdgeEngineCore\n+ LwdEdgeObfVerifier" as EE
+participant "边 Worker\n(embed)" as EW
+end box
+
+box "云侧 (untrusted, 仅混淆 tokenizer)" #FFF0F0
+participant "云引擎\nLwdCloudEngineCore\n+ LwdCloudObfDetokenizer" as CE
+participant "云 Worker\n(推理/采样)" as CW
+end box
+
+queue "UP / DOWN 数据面 (HCCL)" as DP
+queue "e2c / c2e 控制面 (ZMQ)" as CP
+
+== 启动（一次性） ==
+EE -> EE : 加载 trusted 映射 π⁻¹\n(runtime artifact 绑定校验)
+CE -> CE : 加载混淆 tokenizer\n(runtime/mixed_tokenizer.json,\n无私有表)
+note over CE : 云侧只持有混淆词表,\n原生 id 空间不变
+
+== 在线请求 ==
+C -> FE : POST /v1/completions (原文 prompt)
+FE -> FE : 原生 tokenize\n→ prompt_token_ids
+FE -> EE : EngineCoreRequest(prompt_token_ids)
+
+EE -> CP : LwdRequestNotify (max_tokens, eos_id…)
+CP -> CE : (e2c)
+EE -> EW : EMBED 批 (chunk token_ids)
+EW -> EW : embedding (边侧仅 embed 层)
+EW -> DP : **UP hccl**: hidden states 上云
+EE -> CP : LwdRangeNotify (seqno 对齐)
+CP -> CE : (e2c)
+
+CE -> CW : prefill / decode 步
+CW -> CW : 采样 → **新 token ids**\n(原生 id 空间)
+CW --> CE : sampled token ids
+
+note over CE #FFE8E8 : DISABLE_DOWN=1:\n不收集 / 不发 DOWN hidden
+CE -> CE : 混淆 untokenize:\nid → π(bytes) 拼接\n→ PUA carrier “混淆文本”
+CE -> CP : **LwdC2eNotify**\n(token_ids + obf_texts)
+CP -> EE : (c2e)
+
+EE -> EE : UNEMBED 批 (batch_meta.token_ids)\nDISABLE_DOWN 旁路 (BypassFuture)
+
+alt 路径 1：token id 直通（DISABLE_DOWN 原生语义）
+  EE -> FE : EngineCoreOutput(sampled_token_ids)
+  FE -> FE : 原生 IncrementalDetokenizer\n→ 文本 A
+  FE --> C : HTTP 响应 (文本 A)
+end
+
+alt 路径 2：混淆文本 → 边侧解混淆（验证路径）
+  EE -> EE : verifier.feed(token_ids, obf_texts)\n(逐 c2e 行累积, 增量还原)
+  EE -> EE : 请求 finish 行触发 verify:\n  carrier→bytes→π⁻¹→增量UTF-8 → 文本 B\n  native decode(token_ids) → 文本 A′
+  EE -> EE : **A′ == B ?**\nPASS/FAIL 日志 + report JSONL
+end
+
+C -> EE : 读取 report JSONL\n(断言 pass=true 且\ntext_http == HTTP 文本 A)
+@enduml

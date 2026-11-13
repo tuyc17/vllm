@@ -70,6 +70,7 @@ from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.lwd_control.lwd_obfuscation import LwdEdgeObfVerifier
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[int, LwdEdgeToCloudMessage], None]
@@ -113,6 +114,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self.lwd_refill_abort: Callable[[str], None] | None = None
+        # Obfuscation demo verifier; injected by the engine when
+        # lwd_config.obfuscation is set, None keeps delivery verbatim.
+        self.lwd_obf_verifier: LwdEdgeObfVerifier | None = None
         # One account per cloud DP rank; the count comes from the routing
         # entry of any DP of the local (edge) instance, all of which share
         # the same connections.
@@ -461,6 +465,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
+            self._lwd_obf_verify_row(notify, index, sampled_token_ids, finished_now)
             if finished_now:
                 # The ground truth of the cloud's stop decision lands here:
                 # native finish settles the account (KV/cache release and
@@ -488,6 +493,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if finished_now:
                 finished.add(request_id)
         return outputs, finished
+
+    def _lwd_obf_verify_row(
+        self, notify: LwdC2eNotify, index: int, token_ids: list[int], finished: bool
+    ) -> None:
+        """Feed the obfuscation verifier one delivered c2e row; a request's
+        final row also triggers the two-path comparison (token ids ->
+        native detokenize vs. obfuscated carrier -> trusted restore)."""
+        verifier = self.lwd_obf_verifier
+        if verifier is None:
+            return
+        obf_texts = notify.obf_texts
+        obf_text = obf_texts[index] if index < len(obf_texts) else ""
+        verifier.feed(notify.req_ids[index], token_ids, obf_text)
+        if finished:
+            verifier.verify(notify.req_ids[index])
 
     @staticmethod
     def _lwd_finish_code(notify: LwdC2eNotify, index: int) -> FinishReason | None:
