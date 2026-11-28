@@ -10,13 +10,15 @@ import uvloop
 import vllm
 import vllm.envs as envs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.api_server.entry import run_server, setup_server
-from vllm.entrypoints.launchers.cli_args import (
+from vllm.entrypoints.common.cli_args import (
     make_arg_parser,
+    propagate_flash_late_interaction,
     validate_parsed_serve_args,
 )
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.launchers.api_server.entry import run_server, setup_server
 from vllm.entrypoints.launchers.dp_supervisor import run_dp_supervisor
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.launchers.launcher import create_server_socket
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.usage.usage_lib import UsageContext
@@ -153,7 +155,15 @@ class ServeSubcommand(CLISubcommand):
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
-        elif args.api_server_count > 1 or rust_frontend_path:
+        elif (
+            args.api_server_count > 1
+            or rust_frontend_path
+            # An LWD attach primary must run the attach pipeline (its
+            # registration server) even with a single planned frontend;
+            # the single in-process path leaves --api-server-rpc-port
+            # unbound and attach frontends hang on it.
+            or getattr(args, "lwd_attach_primary", False)
+        ):
             run_multi_api_server(args)
         else:
             # Single API server (this process).
@@ -192,6 +202,7 @@ def run_headless(args: argparse.Namespace):
 
     # Create the EngineConfig.
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    propagate_flash_late_interaction(args, engine_args)
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(
         usage_context=usage_context, headless=True
@@ -307,8 +318,16 @@ def run_multi_api_server(args: argparse.Namespace):
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=num_api_servers > 1)
+    # `--grpc-port` is only accepted for the Rust frontend, which inherits this
+    # listener like the HTTP one. gRPC follows the HTTP TCP host, or IPv4
+    # loopback when HTTP uses a Unix socket.
+    grpc_sock = None
+    if args.grpc_port is not None:
+        grpc_host = "127.0.0.1" if args.uds else (args.host or "")
+        grpc_sock = create_server_socket((grpc_host, args.grpc_port), reuse_port=False)
 
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    propagate_flash_late_interaction(args, engine_args)
     engine_args._api_process_count = num_api_servers
     engine_args._api_process_rank = -1
 
@@ -331,22 +350,14 @@ def run_multi_api_server(args: argparse.Namespace):
         None
     )
 
-    from vllm.v1.engine.utils import get_engine_zmq_addresses
+    from vllm.v1.engine.utils import bind_engine_zmq_listeners
 
-    # Defer port allocation to the child's bind() to avoid TOCTOU, except
-    # for Rust front-end and Ray DP, which can't see the post-bind rebind
-    # (CLI-arg subprocess / pickled-into-actor snapshot respectively) and
-    # so pre-allocate driver-side -- reintroducing the original race only
-    # there.
     is_ray_dp = parallel_config.data_parallel_backend == "ray"
     attach_mode, num_local_servers, registration_server = prepare_attach_mode(
         args, num_api_servers, is_ray_dp
     )
-    addresses = get_engine_zmq_addresses(
-        vllm_config,
-        num_api_servers,
-        defer_api_server_ports=not (rust_frontend_path or is_ray_dp),
-    )
+    zmq_listeners = bind_engine_zmq_listeners(vllm_config, num_api_servers)
+    addresses = zmq_listeners.addresses
 
     with (
         launch_core_engines(
@@ -375,9 +386,10 @@ def run_multi_api_server(args: argparse.Namespace):
             api_server_manager = RustFrontendProcessManager(
                 binary_path=rust_frontend_path,
                 sock=sock,
+                grpc_sock=grpc_sock,
                 args=args,
-                input_address=addresses.inputs[0],
-                output_address=addresses.outputs[0],
+                input_listener=zmq_listeners.inputs[0],
+                output_listener=zmq_listeners.outputs[0],
                 engine_start_index=expected_engine_start_index,
                 engine_count=expected_engine_count,
                 data_parallel_size=parallel_config.data_parallel_size,
@@ -391,26 +403,13 @@ def run_multi_api_server(args: argparse.Namespace):
                 sock=sock,
                 args=args,
                 num_servers=num_local_servers,
-                input_addresses=addresses.inputs[:num_local_servers],
-                output_addresses=addresses.outputs[:num_local_servers],
+                input_listeners=zmq_listeners.inputs[:num_local_servers],
+                output_listeners=zmq_listeners.outputs[:num_local_servers],
                 stats_update_address=stats_update_address,
                 tensor_queue=engine_launch.tensor_queue,
                 client_count=num_api_servers if attach_mode else None,
                 client_indices=[0] if attach_mode else None,
             )
-
-            if not is_ray_dp:
-                # Forward each child's bound endpoints to the engine handshake
-                # (runs on ``with`` exit). Skipped for Ray DP, where addresses
-                # are pre-allocated above and Ray actors already hold them.
-                actual_inputs, actual_outputs = (
-                    api_server_manager.gather_actual_addresses()
-                )
-                for local_index, client_index in enumerate(
-                    api_server_manager.client_indices
-                ):
-                    addresses.inputs[client_index] = actual_inputs[local_index]
-                    addresses.outputs[client_index] = actual_outputs[local_index]
 
             if registration_server is not None:
                 wait_for_attach_registrations(

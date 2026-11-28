@@ -77,21 +77,29 @@ class LwdEdgePrefixControl:
         request.block_hashes = []
         request._block_hasher = engine.request_block_hasher
         request.update_block_hashes()
-        expired = LwdPrefixReadyNotify(
-            request.request_id,
-            0,
-            request.lwd_prefix_nonce,
-            "prefix reply timed out",
-        )
-        timer = threading.Timer(
-            self._timeout_s,
-            engine.input_queue.put_nowait,
-            args=((EngineCoreRequestType.WAKEUP, expired),),
-        )
+
+        def expire() -> None:
+            pending = self._pending.get(request.request_id)
+            if pending is None or pending[0] is not request:
+                return
+            expired = LwdPrefixReadyNotify(
+                request.request_id,
+                0,
+                getattr(request, "lwd_prefix_nonce", 0),
+                "prefix reply timed out",
+            )
+            engine.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, expired))
+
+        timer = threading.Timer(self._timeout_s, expire)
         timer.daemon = True
         self._pending[request.request_id] = (request, timer)
         try:
             submission = engine._lwd_probe_manager.submit(request)
+            if submission is LwdProbeSubmission.FAILED:
+                self._pending.pop(request.request_id, None)
+                timer.cancel()
+                engine._lwd_abort_internally(request)
+                return
             if submission is LwdProbeSubmission.UNAVAILABLE:
                 engine._lwd_add_request_after_probe(request)
         except Exception:
@@ -118,11 +126,20 @@ class LwdEdgePrefixControl:
             )
             self._rollback_and_abort(request)
             return True
-        if self._engine.scheduler.lwd_edge_prefix_ready(request, reply.hit_tokens):
+        if reply.replay_start < 0:
+            accepted = self._engine.scheduler.lwd_edge_prefix_ready(
+                request, reply.hit_tokens
+            )
+        else:
+            accepted = self._engine.scheduler.lwd_edge_prefix_ready(
+                request, reply.hit_tokens, reply.replay_start
+            )
+        if accepted:
             lwd_logger.info(
-                "[prefix] READY req=%s hit_tokens=%d",
+                "[prefix] READY req=%s hit_tokens=%d replay_start=%d",
                 reply.request_id,
                 reply.hit_tokens,
+                reply.replay_start,
             )
             self._engine._lwd_enqueue_request(request)
         else:

@@ -14,13 +14,14 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
@@ -29,6 +30,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdPrefixReservations,
     prefix_start,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
@@ -89,12 +91,18 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
+        self._lwd_prefill_lookahead_tokens = (
+            self.vllm_config.num_prefill_lookahead_tokens
+        )
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
+        self.lwd_finished_records: dict[str, tuple[int, int | None, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
-        self.lwd_refill_sender = None
+        # Wired by the cloud engine during assembly (prefix-cache init):
+        # reservation table + refill notify sender, or None with caching off.
+        self.lwd_prefix_reservations: LwdPrefixReservations | None = None
+        self.lwd_refill_sender: Callable[[str, int, int, int], None] | None = None
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -113,7 +121,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
-        self._lwd_attach_mrope_positions(out)
+        self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
 
@@ -124,7 +132,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 LwdReqPhase.DECODE,
                 self.running,
                 self.waiting,
-                self.skipped_waiting,
+                self.kv_holding_waiting,
             )
         ]
 
@@ -156,18 +164,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Revalidate a preempted request against live blocks and arrivals."""
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
-            # Fail-open requests have no initial reservation by contract.
-            # Recompute the full prompt after preemption instead of creating a
-            # fictitious zero-hit reservation or triggering a refill.
-            self.lwd_prefix_hits[request.request_id] = 0
-            return True
+        """Revalidate a preempted request against live blocks and arrivals.
+
+        Every admitted request went through nonce/READY negotiation: it
+        carries a reservation floor and its staged prompt may be trimmed up
+        to that floor, regardless of whether the edge's gateway probe
+        succeeded. Readmission must therefore never bypass this
+        revalidation: scheduling below the floor without a refill reads
+        host-stage rows the edge never sent.
+        """
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
         floor = self.lwd_prefix_hits.get(
             request.request_id, getattr(request, "lwd_resume_cap_tokens", 0)
         )
+        groups: tuple[list[KVCacheBlock], ...]
         if request.skip_reading_prefix_cache:
             groups, h_prime = (), 0
             shared_prefix_boundary = 0
@@ -226,14 +237,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate.discard(request_id)
         self.lwd_prefix_hits[request_id] = pending.hit_tokens
         if request is not None:
-            request.lwd_resume_cap_tokens = pending.hit_tokens
+            request.lwd_resume_cap_tokens = pending.hit_tokens  # type: ignore[attr-defined]
 
     def _lwd_collect_prefill_windows(self, room: int) -> list[_LwdPrefillWindow]:
         windows: list[_LwdPrefillWindow] = []
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
         requests = list(
-            itertools.chain(self.running, self.waiting, self.skipped_waiting)
+            itertools.chain(self.running, self.waiting, self.kv_holding_waiting)
         )
         grouped: dict[int, list[Request]] = {}
         for request in requests:
@@ -275,6 +286,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             num_rows = min(arrived, room)
             if num_rows < room and recv_rows < request.num_prompt_tokens:
                 continue
+            lookahead = getattr(self, "_lwd_prefill_lookahead_tokens", 0)
+            if (
+                start + num_rows < request.num_prompt_tokens
+                and start + num_rows + lookahead > recv_rows
+            ):
+                continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
         return windows
@@ -288,7 +305,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         total_windows = sum(window.num_rows for window in windows)
         request_ids = decode_ids + [window.request.request_id for window in windows]
         for window in windows:
-            window.request.lwd_window_cap = window.num_rows
+            window.request.lwd_window_cap = window.num_rows  # type: ignore[attr-defined]
         try:
             return self._lwd_schedule(
                 request_ids,
@@ -296,7 +313,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         finally:
             for window in windows:
-                window.request.lwd_window_cap = None
+                window.request.lwd_window_cap = None  # type: ignore[attr-defined]
 
     def _lwd_verify_w2(
         self,
@@ -310,12 +327,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if scheduled == 0:
                 continue
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
-            if scheduled > window.num_rows or window.start + scheduled > recv_rows:
+            lookahead = getattr(self, "_lwd_prefill_lookahead_tokens", 0)
+            needs_lookahead = (
+                window.start + scheduled < window.request.num_prompt_tokens
+                and window.start + scheduled + lookahead > recv_rows
+            )
+            if (
+                scheduled > window.num_rows
+                or window.start + scheduled > recv_rows
+                or needs_lookahead
+            ):
                 raise RuntimeError(
                     f"[LWD] W2 violation req={request_id}: scheduled rows "
                     f"[{window.start}, {window.start + scheduled}) with "
                     f"window={window.num_rows}, recv_rows={recv_rows}, "
-                    f"decode_exact={decode_exact}"
+                    f"lookahead={lookahead}, decode_exact={decode_exact}"
                 )
 
     @staticmethod
@@ -335,12 +361,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 requested,
             )
 
-    def _lwd_attach_mrope_positions(self, out: SchedulerOutput) -> None:
+    def _lwd_attach_request_metadata(self, out: SchedulerOutput) -> None:
+        """Hand the whole-request values the edge announced to the runner."""
         for data in out.scheduled_new_reqs:
             request = self.requests.get(data.req_id)
-            if request is not None:
-                positions = getattr(request, "lwd_mrope_positions", b"")
-                data.lwd_mrope_positions = b"" if positions is None else positions
+            if request is None:
+                continue
+            positions = getattr(request, "lwd_mrope_positions", b"")
+            data.lwd_mrope_positions = b"" if positions is None else positions
+            spans = getattr(request, "lwd_image_placeholder_spans", None)
+            data.lwd_image_placeholder_spans = list(spans) if spans else []
 
     @staticmethod
     def _lwd_cache_tokens(request: Request) -> int:
@@ -402,8 +432,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 seqno=-1,
                 batch_meta=LwdEmbedBatch(aborted_req_ids=list(pending)),
             )
-        elif (
-            batch.batch_type is LwdBatchType.LWD_EMBED and batch.batch_meta is not None
+        elif batch.batch_type is LwdBatchType.LWD_EMBED and isinstance(
+            batch.batch_meta, LwdEmbedBatch
         ):
             existing = list(batch.batch_meta.aborted_req_ids or ())
             batch.batch_meta.aborted_req_ids = existing + [

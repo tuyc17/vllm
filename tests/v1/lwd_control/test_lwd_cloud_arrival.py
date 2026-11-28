@@ -58,6 +58,16 @@ class _DoneMq:
         raise TimeoutError
 
 
+def _append_and_return(items: list[Any], marker: Any, result: Any) -> Any:
+    items.append(marker)
+    return result
+
+
+def _extend_and_return(items: list[Any], values: Any) -> Any:
+    items.extend(values)
+    return values
+
+
 def _request(
     request_id: str = "p",
     prompt: int = 10,
@@ -88,7 +98,8 @@ def _visible_set_scheduler(
     scheduler = LwdBaseScheduler.__new__(LwdBaseScheduler)
     scheduler.running = running
     scheduler.waiting = FCFSRequestQueue(waiting)
-    scheduler.skipped_waiting = FCFSRequestQueue()
+    scheduler.kv_holding_waiting = FCFSRequestQueue()
+    scheduler.deferred_waiting = set()
     scheduler.requests = {r.request_id: r for r in running + waiting}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.max_num_running_reqs = len(running)
@@ -101,7 +112,8 @@ def _scheduler(request: _Request) -> LwdCloudScheduler:
     scheduler = LwdCloudScheduler.__new__(LwdCloudScheduler)
     scheduler.running = [request]
     scheduler.waiting = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.requests = {request.request_id: request}
     scheduler.lwd_recv_rows = {}
     scheduler._lwd_dropped = set()
@@ -113,6 +125,24 @@ def _scheduler(request: _Request) -> LwdCloudScheduler:
     scheduler.lwd_prefix_hits = {}
     scheduler.lwd_finished_records = {}
     return scheduler
+
+
+def test_decode_requests_include_all_native_waiting_queues() -> None:
+    running = _request("running", computed=10)
+    waiting = _request("waiting", computed=10)
+    kv_holding = _request("kv-holding", computed=10)
+    scheduler = _scheduler(running)
+    scheduler.waiting = [waiting]
+    scheduler.kv_holding_waiting = [kv_holding]
+    scheduler.requests.update(
+        {request.request_id: request for request in (waiting, kv_holding)}
+    )
+
+    assert scheduler._lwd_collect_decode_requests() == [
+        "running",
+        "waiting",
+        "kv-holding",
+    ]
 
 
 def _prefix_scheduler(
@@ -172,14 +202,35 @@ def test_fragment_waits_but_final_and_budget_limited_windows_run() -> None:
     assert [(w.start, w.num_rows) for w in final_window] == [(2, 8)]
 
 
+def test_nonfinal_window_requires_lookahead_arrival() -> None:
+    scheduler = _scheduler(_request())
+    scheduler._lwd_prefill_lookahead_tokens = 1
+    scheduler.lwd_recv_rows["p"] = 5
+
+    assert scheduler._lwd_collect_prefill_windows(room=3) == []
+
+    scheduler.lwd_recv_rows["p"] = 6
+    windows = scheduler._lwd_collect_prefill_windows(room=3)
+    assert [(window.start, window.num_rows) for window in windows] == [(2, 3)]
+    scheduler._lwd_verify_w2(
+        SimpleNamespace(num_scheduled_tokens={"p": 3}), windows, decode_exact=0
+    )
+
+
 def test_decode_exact_is_accounted_before_prefill_windows() -> None:
     scheduler = _scheduler(_request())
     scheduler.max_num_scheduled_tokens = 10
-    calls = []
+    calls: list[Any] = []
     out = SchedulerOutput.make_empty()
-    scheduler._lwd_collect_decode_requests = lambda: calls.append("decode") or ["d"]
-    scheduler._lwd_compute_decode_consumption = lambda ids: calls.append(ids) or 3
-    scheduler._lwd_collect_prefill_windows = lambda room: calls.append(room) or []
+    scheduler._lwd_collect_decode_requests = lambda: _append_and_return(
+        calls, "decode", ["d"]
+    )
+    scheduler._lwd_compute_decode_consumption = lambda ids: _append_and_return(
+        calls, ids, 3
+    )
+    scheduler._lwd_collect_prefill_windows = lambda room: _append_and_return(
+        calls, room, []
+    )
     scheduler._lwd_schedule = lambda ids: out
 
     assert scheduler._lwd_schedule_step() is out
@@ -274,12 +325,40 @@ def test_visible_set_preserves_non_preempted_order_when_output_is_none(
     ]
 
 
+def test_visible_set_restores_native_deferred_and_kv_holding_queues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden_waiting = _request("hidden-waiting")
+    visible_deferred = _request("visible-deferred")
+    hidden_kv = _request("hidden-kv")
+    visible_kv = _request("visible-kv")
+    scheduler = _visible_set_scheduler([], [hidden_waiting, visible_deferred])
+    scheduler.kv_holding_waiting = FCFSRequestQueue([hidden_kv, visible_kv])
+    scheduler.deferred_waiting = {visible_deferred, hidden_kv, visible_kv}
+    scheduler.requests.update(
+        {request.request_id: request for request in (hidden_kv, visible_kv)}
+    )
+
+    def native_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        assert list(self.waiting) == [visible_deferred]
+        assert list(self.kv_holding_waiting) == [visible_kv]
+        assert self.deferred_waiting == {visible_deferred, visible_kv}
+        return SchedulerOutput.make_empty()
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", native_schedule)
+    scheduler._lwd_schedule(["visible-deferred", "visible-kv"])
+
+    assert list(scheduler.waiting) == [visible_deferred, hidden_waiting]
+    assert list(scheduler.kv_holding_waiting) == [visible_kv, hidden_kv]
+    assert scheduler.deferred_waiting == {visible_deferred, hidden_kv, visible_kv}
+
+
 def test_preemption_recomputes_window_from_zero_and_clears_cap() -> None:
     request = _request(prompt=10, computed=4)
     scheduler = _scheduler(request)
     scheduler.max_num_scheduled_tokens = 10
     scheduler.lwd_recv_rows["p"] = 10
-    calls = []
+    calls: list[Any] = []
 
     def schedule(
         request_ids: list[str], *, token_budget_cap: int | None = None
@@ -365,7 +444,7 @@ def test_full_prompt_mrope_reaches_scheduled_new_request() -> None:
     data = SimpleNamespace(req_id="p", lwd_mrope_positions=None)
     out = SimpleNamespace(scheduled_new_reqs=[data])
 
-    scheduler._lwd_attach_mrope_positions(out)
+    scheduler._lwd_attach_request_metadata(out)
     assert data.lwd_mrope_positions == b"positions"
 
 
@@ -389,7 +468,7 @@ def test_range_notify_posts_only_extended_hint(monkeypatch: pytest.MonkeyPatch) 
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"a": 8, "b": 6})
-    posted = []
+    posted: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -441,11 +520,11 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(
     }
     engine._lwd_ledger.track_range(_CONNECTION, 1, ["a"])
     engine._lwd_ledger.track_range(_CONNECTION, 2, ["a", "b"])
-    watermark = []
+    watermark: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
+        lambda items: _extend_and_return(watermark, items),
     )
 
     engine._lwd_drain_irecv_completions()
@@ -521,7 +600,7 @@ def test_abort_before_mixed_range_still_posts_complete_hint(
     engine.input_queue = queue.Queue()
     engine._lwd_ledger.track_range(_CONNECTION, 6, ["a"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("a"))
-    posted = []
+    posted: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -607,11 +686,11 @@ def test_worker_error_fails_connection_without_advancing_failed_item(
     engine._lwd_fail_connection = lambda connection, seqno, error: failures.append(
         f"seqno={seqno}: {error}"
     )
-    watermark = []
+    watermark: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
+        lambda items: _extend_and_return(watermark, items),
     )
 
     engine._lwd_drain_irecv_completions()
@@ -678,6 +757,33 @@ def test_skip_reading_readmission_does_not_lookup() -> None:
     assert [(w.start, w.num_rows) for w in windows] == [(0, 16)]
     scheduler.kv_cache_manager.coordinator.find_longest_cache_hit.assert_not_called()
     scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
+
+
+def test_readmission_below_floor_gates_behind_refill_despite_full_arrivals() -> None:
+    """Regression: a preempted request whose live hit fell below the
+    reservation floor must be gated behind a refill even when every
+    post-trim row has already arrived -- the [0, floor) host rows were
+    trimmed by the edge, so scheduling from 0 would read an unfilled hole
+    and kill the host stage."""
+    request = _request(prompt=131784, computed=0, preemptions=1, floor=8192)
+    request.lwd_prefix_nonce = 11
+    scheduler = _prefix_scheduler(request, (), hit=0, recv_rows=131784)
+
+    assert scheduler._lwd_collect_prefill_windows(room=8176) == []
+    scheduler.lwd_refill_sender.assert_called_once_with("p", 0, 8192, 11)
+    assert scheduler._lwd_refill_gate == {"p"}
+    # Readmission re-established the reservation, keeping the fail-closed
+    # snapshot contract intact.
+    assert scheduler.lwd_prefix_reservations.snapshot(request) == ((), 0, 0)
+
+    # Still gated: arrivals alone cannot lift a refill.
+    assert scheduler._lwd_collect_prefill_windows(room=8176) == []
+    scheduler.lwd_refill_sender.assert_called_once()
+
+    scheduler.lwd_refill_done("p", 11)
+    assert scheduler._lwd_refill_gate == set()
+    windows = scheduler._lwd_collect_prefill_windows(room=8176)
+    assert [(w.start, w.num_rows) for w in windows] == [(0, 8176)]
 
 
 def test_c2e_prefix_nonces_read_from_snapshot() -> None:
@@ -758,6 +864,45 @@ def test_free_request_cleans_prefix_reservation_and_refill_gate(
     assert scheduler._lwd_refill_gate == set()
     assert scheduler._lwd_refill_pending == {}
     assert scheduler.lwd_finished_records["p"] == (10, 0, 11)
+
+
+@pytest.mark.parametrize(
+    ("completion_tokens", "expected"),
+    [(0, None), (3, 3)],
+)
+def test_abort_usage_snapshot_distinguishes_zero_and_accepted_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    completion_tokens: int,
+    expected: int | None,
+) -> None:
+    request = _request()
+    request.num_tokens += completion_tokens
+    request.status = RequestStatus.FINISHED_ABORTED
+    request.lwd_prefix_nonce = 11
+    scheduler = _scheduler(request)
+    monkeypatch.setattr(
+        AsyncScheduler,
+        "_free_request",
+        lambda self, request, delay_free_blocks=False: (None, None),
+    )
+
+    scheduler._free_request(request)
+
+    assert scheduler.lwd_finished_records["p"] == (10, expected, 11)
+
+
+def test_publish_aborted_zero_tokens_marks_usage_unavailable() -> None:
+    engine = _engine()
+    engine.scheduler.lwd_finished_records = {"p": (16, None, 7)}
+    engine.cloud_control_event_queue = queue.Queue()
+    engine._lwd_engine_index = 1
+
+    engine._lwd_publish_finished_usage(None)
+
+    event = engine.cloud_control_event_queue.get_nowait()
+    assert event["type"] == "usage"
+    assert event["usage"] is None
+    assert engine.scheduler.lwd_finished_records == {}
 
 
 def test_publish_finished_usage_keeps_snapshot_nonce() -> None:

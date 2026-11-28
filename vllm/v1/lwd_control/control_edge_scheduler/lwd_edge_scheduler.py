@@ -12,7 +12,7 @@ result terminates the request (finish code mapped to native finish), and
 late results are idempotently dropped.
 
 One LwdCloudDpAccount holds every per-engine bookkeeping (seqno stream,
-pending batches, load, gate); the routing table is pinned at admission and
+pending batches, gate); the routing table is pinned at admission and
 never changes, so a request's chunks, aborts and results all travel
 through its engine's account. Each schedule step serves one engine: a
 RangeNotify, a seqno and a UP channel belong to exactly one engine. With
@@ -26,8 +26,6 @@ import copy
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
-
-import torch
 
 from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
@@ -46,6 +44,9 @@ from vllm.v1.engine import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
     LwdCloudDpAccount,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_health import (
+    lwd_rotate_targets,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
@@ -66,6 +67,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
+    LwdModelFamily,
+    lwd_select_model_family,
+)
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -90,6 +95,24 @@ def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
     scheduler_config.cache_config = copy.copy(vllm_config.cache_config)
     scheduler_config.cache_config.enable_prefix_caching = False
     return scheduler_config
+
+
+def _lwd_first_connection(
+    connections: tuple[LwdConnectionId, ...], edge_id: int
+) -> int:
+    """Index of the connection of the edge's staggered first DP."""
+    pairs = tuple(
+        (connection_id.cloud_id, connection_id.dp_idx) for connection_id in connections
+    )
+    rotated = lwd_rotate_targets(pairs, edge_id)
+    if not rotated:
+        return 0
+    first = rotated[0]
+    return next(
+        index
+        for index, connection_id in enumerate(connections)
+        if (connection_id.cloud_id, connection_id.dp_idx) == first
+    )
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -123,6 +146,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_edge_share = lwd_config.topology.deployment.scene == "edge_share"
         connections = tuple(sorted(c.connection_id for c in lwd_config.connections))
         self._lwd_connections = connections
+        # Liveness verdict of the engine's sweep (frozen snapshot,
+        # atomically swapped in via lwd_update_silent_routes): a route the
+        # sweep declared dead stays out of the routing candidates while
+        # its siblings are alive.
+        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
             connection_id: LwdCloudDpAccount(connection_id)
             for connection_id in connections
@@ -132,8 +160,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         }
         self._lwd_route: dict[str, LwdConnectionId] = {}
         """Request id -> full connection, pinned at admission."""
-        self._lwd_last_engine = -1
-        """Round-robin anchor shared by routing and engine picking."""
+        self._lwd_last_engine = (
+            _lwd_first_connection(connections, lwd_config.instance_id) - 1
+        )
+        """Round-robin anchor shared by routing and engine picking; advanced
+        only by the step that serves a connection, never by a liveness
+        query."""
+        # max_num_seqs is one cloud DP's seat count (the handshake rejects a
+        # mismatch), so the edge serves that many per connection and this
+        # product is the concurrency the deployment actually offers.
+        lwd_logger.info(
+            "[edge-sched] seats: %d per connection x %d connections = %d",
+            self.max_num_running_reqs,
+            len(connections),
+            self.max_num_running_reqs * len(connections),
+        )
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -143,16 +184,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
         self.unembed_notify_queue: deque[tuple[LwdConnectionId, LwdC2eNotify]] = deque()
-        # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
-        # tensor, computed once at admission and sent in RequestNotify);
-        # removed on embedding completion/abort. Key present = has_mrope is
-        # always true for every chunk of that request.
-        self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
-        # Lazily resolved model-class static method
-        # _get_mrope_input_positions (cache the method itself rather than
-        # the model class so the semantics stay direct; validated on first
-        # use, unsupported families fail fast).
-        self._lwd_mrope_positions_fn = None
+        # Per-model-family admission metadata: whole-prompt M-RoPE
+        # positions for multimodal families. Computed once at admission from
+        # the real prompt (only the edge holds it) and announced with the
+        # request; reclaimed by the harvest reconciliation once the prompt
+        # is fully sent.
+        self.lwd_model_family: LwdModelFamily = lwd_select_model_family(
+            self.vllm_config
+        )
         # Chunk unit C = min(remaining, C): taken from the local
         # long_prefill_token_threshold (native truncation boundary,
         # naturally reproduced on both sides); when unset (<=0), falls back
@@ -170,10 +209,37 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     ) -> None:
         """Apply one cloud's HELLO parameters without mutating global config."""
         account = self._lwd_accounts[connection_id]
-        account.num_speculative_tokens = max(0, params.num_speculative_tokens)
         account.prefix_use_eagle = params.prefix_use_eagle
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
+
+    def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        """Seed a runtime-added connection's bookkeeping BEFORE its link
+        opens: the cloud's limits can arrive on the IO thread within one
+        hello-retry of registration and `lwd_update_cloud_params`
+        subscripts these maps. Idempotent. The connection deliberately
+        does NOT join the routing candidates — the admission gate keeps
+        rejecting it until its data-plane link exists (a later phase),
+        and routing an unservable connection is worse than refusing it."""
+        if connection_id not in self._lwd_accounts:
+            self._lwd_accounts[connection_id] = LwdCloudDpAccount(connection_id)
+        self._lwd_aborted_req_ids.setdefault(connection_id, [])
+
+    def lwd_update_silent_routes(self, silent: frozenset[LwdConnectionId]) -> None:
+        """Engine thread: the liveness sweep's frozen verdict (a cloud DP
+        went silent, or its heartbeat resumed). One atomic frozenset swap;
+        routing reads it on the same thread."""
+        self._lwd_silent_routes = silent
+
+    def lwd_add_runtime_route(self, connection_id: LwdConnectionId) -> None:
+        """Open a runtime connection for service: it joins the routing
+        candidates (sorted, so the round-robin order stays stable).
+        Idempotent. Legacy int-indexed send watermarks
+        (`_lwd_connections[dp_idx]`) predate runtime additions and keep
+        meaning link indices of the startup plan."""
+        if connection_id in self._lwd_connections:
+            return
+        self._lwd_connections = tuple(sorted((*self._lwd_connections, connection_id)))
 
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed dp_idx of an active request; unrouted ids are a bug."""
@@ -215,7 +281,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         best = min(
             candidates.values(),
             key=lambda account: (
-                account.score(),
                 (
                     self._lwd_connections.index(account.connection_id)
                     - self._lwd_last_engine
@@ -233,7 +298,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         connections originating at edge_id are candidates (the shared
         edge_share engine would otherwise balance every logical edge's
         request across every cloud); a healthy preferred route wins when
-        supplied, otherwise score and ordered round-robin decide."""
+        supplied, otherwise ordered round-robin decides."""
         accounts = self._lwd_accounts
         candidates = {
             connection_id: accounts[connection_id]
@@ -245,6 +310,37 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"[LWD] no cloud connection for edge_id={edge_id} "
                 f"(request {request_id})"
             )
+        # Liveness: a route the sweep declared silent is not a candidate —
+        # round-robin must not keep sending requests to a dead cloud while
+        # a sibling route is alive (partial silence: the gate admits, so
+        # the dead cloud would otherwise eat every other request). Fail
+        # open when every candidate is silent: the gate already rejects
+        # the fully-silent case at admission, so this covers only the
+        # admit/route race, and the transfer containment owns whatever
+        # still slips through.
+        healthy = {
+            connection_id: account
+            for connection_id, account in candidates.items()
+            if connection_id not in self._lwd_silent_routes
+        }
+        if healthy:
+            candidates = healthy
+        if preferred is not None and preferred not in candidates:
+            # The probe produced a preference the router cannot honor: the
+            # connection is not a serviceable routing candidate (data-plane
+            # build refused) or the liveness sweep declared it silent. The
+            # request silently falls back — this log is the elastic
+            # scale-out diagnosis cue.
+            lwd_logger.error(
+                "[LWD] preferred %s is not a routing candidate for "
+                "edge_id=%d (request %s): candidates=%s silent=%s; "
+                "falling back to score/round-robin",
+                preferred,
+                edge_id,
+                request_id,
+                [cid for cid in candidates],
+                sorted(self._lwd_silent_routes),
+            )
         if preferred is not None and preferred in candidates:
             best = candidates[preferred]
         elif len(candidates) == 1:
@@ -253,7 +349,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             best = min(
                 candidates.values(),
                 key=lambda account: (
-                    account.score(),
                     (
                         self._lwd_connections.index(account.connection_id)
                         - self._lwd_last_engine
@@ -264,14 +359,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
         connection_id = best.connection_id
         self._lwd_route[request_id] = connection_id
-        best.note_prefill_admitted(request_id)
         lwd_logger.info(
-            "[edge-route] req=%s edge=%d -> %s (score=%d loads=%s)",
+            "[edge-route] req=%s edge=%d -> %s",
             request_id,
             edge_id,
             connection_id,
-            best.score(),
-            [(a.prefill_load, a.decode_load) for a in accounts.values()],
         )
         return connection_id
 
@@ -284,12 +376,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------- stepping
 
     def has_requests(self) -> bool:
-        """Keep stepping while any UP send still needs watermark settlement.
+        """Whether this step has anything to do; False parks the engine on
+        its input queue.
 
-        A full pending gate stops new EMBED batches, but the empty UNEMBED
-        step still executes the worker and harvests completed sends. Without
-        this predicate the edge can sleep forever with pending sends that no
-        later batch can clear.
+        Keep stepping while any UP send still needs watermark settlement: a
+        full pending gate stops new EMBED batches, but the empty UNEMBED
+        step still executes the worker and harvests completed sends, and
+        without that term the edge sleeps holding sends no later batch can
+        clear.
+
+        Every term is one an event can clear while parked: requests arrive
+        on the input queue, and the control plane posts a WAKEUP for c2e,
+        prefix-ready and refill notifies
+        (`LwdEdgeEngineCore._lwd_dispatch_message`). A term no such event
+        follows would park the edge for good -- which is why
+        dispatchability asks for prefill work rather than for routed
+        requests: a connection whose requests have all sent their prompts
+        keeps the latter true in every decode steady state, and the edge
+        then runs a worker round trip per step producing nothing, competing
+        with the control-plane IO thread for the GIL.
         """
         return (
             bool(self.unembed_notify_queue)
@@ -313,28 +418,41 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         return self._lwd_schedule_unembed()
 
-    def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
-        """Pick the next ungated connection with routed work in stable order."""
-        routed = set(self._lwd_route.values())
-        if not routed:
-            return None
+    def _lwd_servable_connection(self) -> tuple[int, LwdConnectionId] | None:
+        """The connection this step would serve, with its rotation index.
+
+        Pure by contract: the liveness predicate calls this on every step,
+        so advancing the rotation anchor or logging a gate transition here
+        would make a query indistinguishable from a dispatch -- the
+        rotation would skip connections nobody served and the log would
+        flip on every step. Both belong to the dispatching caller.
+        """
         connections = self._lwd_connections
         for offset in range(len(connections)):
             index = (self._lwd_last_engine + 1 + offset) % len(connections)
             connection_id = connections[index]
-            if connection_id not in routed:
+            if not self._lwd_has_prefill_work(connection_id):
                 continue
-            account = self._lwd_accounts[connection_id]
-            if account.is_gated(
+            if self._lwd_accounts[connection_id].is_gated(
                 self.max_num_running_reqs,
                 self._lwd_has_prefill_chunk_inflight(connection_id),
                 num_running_reqs=len(self.running),
             ):
-                self._lwd_log_gate_transition(account)
                 continue
-            self._lwd_last_engine = index
-            return connection_id
+            return index, connection_id
         return None
+
+    def _lwd_take_servable_connection(self) -> LwdConnectionId | None:
+        """`_lwd_servable_connection` for the step that actually serves it:
+        advances the rotation anchor and reports the gate transitions."""
+        servable = self._lwd_servable_connection()
+        for connection_id, account in self._lwd_accounts.items():
+            if self._lwd_has_prefill_work(connection_id):
+                self._lwd_log_gate_transition(account)
+        if servable is None:
+            return None
+        self._lwd_last_engine, connection_id = servable
+        return connection_id
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
         held = account.pending_chunks() >= account.max_pending_chunks
@@ -348,9 +466,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
     def _lwd_embed_dispatchable(self) -> bool:
-        """EMBED dispatchability: some engine has routed work and passes its
-        gate."""
-        return self._lwd_pick_serving_engine() is not None
+        """EMBED dispatchability: some connection holds prefill work and
+        passes its gate."""
+        return self._lwd_servable_connection() is not None
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """Chunked batch + budget clamp + RangeNotify of one engine, then
@@ -361,7 +479,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         advanced num_computed_tokens, so a dropped chunk would never be
         embedded and the next offset would not match the cloud. A notify
         that cannot be sent raises instead."""
-        dp_idx = self._lwd_pick_serving_engine()
+        dp_idx = self._lwd_take_servable_connection()
         if dp_idx is None:
             return self._lwd_schedule_abort_notice()
         out = self._lwd_schedule_batch(dp_idx)
@@ -423,14 +541,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 else {}
             )
             outputs, finished = self._lwd_deliver_unembed(notify, sampled)
-        # EMBED batches have no local accounting (progress was already
-        # advanced optimistically during scheduling; on embedding completion
-        # they naturally transition to decode phase); the harvest phase
-        # uniformly reconciles and cleans up mrope positions (under resident
-        # models requests only leave `requests` upon termination, so the
-        # explicit per-point removal is replaced by reconciliation-style
-        # reclaim)
-        self._lwd_purge_mrope_positions()
+        # EMBED batches have no local accounting: progress was advanced
+        # optimistically during scheduling.
+        self._lwd_release_expired_admission_metadata()
         if not outputs:
             return {}
         return {
@@ -553,10 +666,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # the finished_req_ids handover all go through the native
                 # path). Settle the books BEFORE finish_requests: the
                 # native path removes the request, after which the engine's
-                # route entry and this engine's decode_load would have no
-                # owner left to clean them -- leaking the load would hold
-                # the gate at full slots forever (both sides then idle:
-                # the edge gates every engine, the cloud has no work).
+                # route entry and pending state would have no owner left
+                # to clean them -- a leak would hold the gate forever
+                # (both sides then idle: the edge gates every engine, the
+                # cloud has no work).
                 self._lwd_settle_request(request_id)
                 self.finish_requests(
                     [request_id],
@@ -593,16 +706,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_pick_prefill_batch(
         self, dp_idx: LwdConnectionId
-    ) -> tuple[list[str], dict[str, int], int]:
-        """Pick routed candidates within decode debt and native edge slots."""
+    ) -> tuple[list[str], dict[str, int]]:
+        """Pick routed candidates within the native token and seat budgets."""
         account = self._lwd_accounts[dp_idx]
-        cap = max(
-            0,
-            self.max_num_scheduled_tokens
-            - account.decode_load * account.num_speculative_tokens,
-        )
         # Native edge slots are shared across DP routes. Waiting requests
-        # contribute routing load, but must not reserve slots before admission.
+        # must not reserve slots before admission.
         free_seq = self.max_num_running_reqs - len(self.running)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
@@ -620,7 +728,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdPrefillCandidate(
                 r.request_id, r.num_prompt_tokens, r.num_computed_tokens
             )
-            for r in [*self.skipped_waiting, *self.waiting]
+            for r in [*self.kv_holding_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
             and lwd_grammar_ready(
                 r, RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
@@ -629,7 +737,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         req_ids, expected = lwd_pick_prefill_batch(
             running,
             waiting,
-            cap=cap,
+            cap=self.max_num_scheduled_tokens,
             free_seq=free_seq,
             chunk_unit=(
                 account.prefix_alignment_tokens
@@ -638,15 +746,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 else self._lwd_chunk_unit
             ),
         )
-        return req_ids, expected, cap
+        return req_ids, expected
 
     def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:
         """Chunk batch assembly: the picker selects the batch of one engine,
-        scheduled via the base-class visible-set mechanism (budget clamped
-        to that engine's cap; the chunk split is guaranteed by the clamping
-        parameters to be reproduced natively)."""
-        req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        scheduled via the base-class visible-set mechanism and native budget.
+
+        Only this connection's hidden requests are charged against the seat
+        budget; the siblings' seats belong to other cloud DPs."""
+        req_ids, _expected = self._lwd_pick_prefill_batch(dp_idx)
+        picked = set(req_ids)
+        hidden_seats = sum(
+            1
+            for request in self.running
+            if request.request_id not in picked
+            and self._lwd_route.get(request.request_id) == dp_idx
+        )
+        return self._lwd_schedule(req_ids, hidden_seats=hidden_seats)
 
     def _try_schedule_encoder_inputs(
         self,
@@ -655,11 +771,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """Edge-side passthrough: encoder execution and caching are managed
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
-        return [], num_new_tokens, encoder_compute_budget, []
+        return [], num_new_tokens, encoder_compute_budget, [], []
+
+    def _lwd_has_prefill_work(self, dp_idx: LwdConnectionId) -> bool:
+        """Whether this connection holds prefill the picker could batch.
+
+        Same two sources as `_lwd_pick_prefill_batch`: a resume still in
+        running, or a queued request routed here. A routed request that
+        already sent its whole prompt is not edge work -- only the cloud
+        advances it -- so a connection holding nothing else is the normal
+        decode steady state, and stepping for it produces nothing.
+        """
+        if self._lwd_has_prefill_chunk_inflight(dp_idx):
+            return True
+        return any(
+            self._lwd_route.get(request.request_id) == dp_idx
+            for queue in (self.kv_holding_waiting, self.waiting)
+            for request in queue
+        )
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:
         """Whether dp_idx has an embed request not fully sent; same
@@ -675,7 +808,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_request_active(self, request_id: str) -> bool:
         if request_id in self._lwd_route or request_id in self.requests:
             return True
-        announced = getattr(self, "_lwd_announced_refills", set())
+        announced: set[tuple[LwdConnectionId, int]] = getattr(
+            self, "_lwd_announced_refills", set()
+        )
         return any(
             (account.connection_id, seqno) in announced and request_id in request_ids
             for account in self._lwd_accounts.values()
@@ -686,94 +821,46 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self, request: Request, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:
         """Scheduler-local half of request admission: mode boundary
-        validation, mrope precomputation and routing. Returns the routed
-        dp_idx; the cloud announcement and enqueueing belong to the
-        engine's add_request; abort_immediately goes through the native
-        engine path (the ledger is pruned in the abort_requests override)."""
+        validation, model-family metadata precomputation and routing.
+        Returns the routed dp_idx; the cloud announcement and enqueueing
+        belong to the engine's add_request; abort_immediately goes through
+        the native engine path (the ledger is pruned in the abort_requests
+        override)."""
         self._lwd_validate_request(request)
-        self._lwd_compute_mrope_positions(request)
+        self.lwd_model_family.admit(request)
         return self._lwd_route_request(
             request.request_id, self._lwd_edge_id_of(request), preferred
         )
 
-    def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
+    def lwd_edge_prefix_ready(
+        self, request: Request, hit_tokens: int, replay_start: int = -1
+    ) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size
-        valid = 0 <= hit_tokens < request.num_prompt_tokens and (
+        start = hit_tokens if replay_start < 0 else replay_start
+        valid = 0 <= start <= hit_tokens < request.num_prompt_tokens and (
             hash_block_size <= 0 or hit_tokens % hash_block_size == 0
         )
         if not valid:
             lwd_logger.error(
-                "[prefix] invalid READY hit req=%s hit=%d",
+                "[prefix] invalid READY hit req=%s hit=%d replay_start=%d",
                 request.request_id,
                 hit_tokens,
+                replay_start,
             )
             request.num_computed_tokens = 0
             return False
-        request.num_computed_tokens = hit_tokens
+        request.num_computed_tokens = start
+        if 0 <= replay_start < hit_tokens:
+            request.replay_start = replay_start
         return True
 
     def lwd_edge_cancel_admission(self, request_id: str) -> None:
         self._lwd_settle_request(request_id)
-        self._lwd_mrope_positions_dict.pop(request_id, None)
-
-    @staticmethod
-    def _lwd_request_has_mm(request: Request) -> bool:
-        """Whether the request carries real multimodal data (prompt_embeds
-        passthrough does not count -- it has no grid metadata, mrope is
-        handled as text positions, consistent with the native
-        definition)."""
-        return any(
-            feature.modality != "prompt_embeds" for feature in request.mm_features
-        )
-
-    def _lwd_compute_mrope_positions(self, request: Request) -> None:
-        """At multimodal admission, compute the whole-prompt [3,N] mrope
-        (only the edge holds the real prompt/grid); reject model families
-        lacking _get_mrope_input_positions."""
-        if not self.vllm_config.model_config.uses_mrope:
-            return
-        if not self._lwd_request_has_mm(request):
-            return
-        if self._lwd_mrope_positions_fn is None:
-            from vllm.model_executor.models import ModelRegistry
-
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                self.vllm_config.model_config.architectures,
-                self.vllm_config.model_config,
-            )
-            fn = getattr(model_cls, "_get_mrope_input_positions", None)
-            if fn is None:
-                raise ValueError(
-                    f"[LWD] multimodal requests in prefill-only mode "
-                    f"require a model class exposing "
-                    f"_get_mrope_input_positions (Qwen3VL family, incl. "
-                    f"Qwen3.5); got {model_cls.__name__} "
-                    f"(request {request.request_id})"
-                )
-            self._lwd_mrope_positions_fn = fn
-        mrope_features = [
-            f for f in request.mm_features if f.modality != "prompt_embeds"
-        ]
-        positions, _delta = self._lwd_mrope_positions_fn(
-            input_tokens=list(request.prompt_token_ids),
-            mm_features=mrope_features,
-            config=self.vllm_config.model_config.hf_config,
-        )
-        assert positions.shape[1] == request.num_prompt_tokens, (
-            f"[LWD] mrope positions width {positions.shape[1]} != prompt "
-            f"len {request.num_prompt_tokens} (request {request.request_id})"
-        )
-        self._lwd_mrope_positions_dict[request.request_id] = positions
-        # [Lwd][perf] per-request latency of whole-prompt mrope computation
-        # (runs on the edge engine main thread; the scheduling loop stalls
-        # meanwhile; used for MM degradation attribution)
+        self.lwd_model_family.release(request_id)
 
     def lwd_mrope_positions(self, request_id: str) -> bytes:
         """Return full-prompt positions for the engine's RequestNotify."""
-        positions = self._lwd_mrope_positions_dict.get(request_id)
-        if positions is None:
-            return b""
-        return positions.contiguous().numpy().tobytes()
+        return self.lwd_model_family.prompt_mrope_positions(request_id) or b""
 
     def lwd_edge_notify_range(
         self, dp_idx: LwdConnectionId, scheduler_output: SchedulerOutput
@@ -952,7 +1039,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # optimistically; the start offset must step back by this
             # step's amount
             offset = request.num_computed_tokens - num_tokens
-            req_has_mrope = request_id in self._lwd_mrope_positions_dict
+            req_has_mrope = self.lwd_model_family.has_mrope_positions(request_id)
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
@@ -988,38 +1075,48 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if dp_idx is not None:
                 routed_aborts.append((dp_idx, request_id))
                 self._lwd_aborted_req_ids[dp_idx].append(request_id)
-            self._lwd_mrope_positions_dict.pop(request_id, None)
+            self.lwd_model_family.release(request_id)
             self._lwd_settle_request(request_id)
         return routed_aborts
+
+    def lwd_edge_up_batch_request_ids(
+        self, connection: LwdConnectionId, seqnos: list[int]
+    ) -> list[str]:
+        """Requests whose UP send failed mid-flight (containment input): the
+        batch entries still sit in the account's pending bookkeeping and
+        release through the abort path that follows this lookup."""
+        account = self._lwd_accounts.get(connection)
+        if account is None:
+            return []
+        request_ids: set[str] = set()
+        for seqno in seqnos:
+            request_ids.update(account.pending_batches.get(seqno, ()))
+        return sorted(request_ids)
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
     ) -> bool:
-        """Claim a live cloud result and move its load to decode exactly once;
-        terminated/unknown requests are idempotently dropped."""
+        """Claim a live cloud result; terminated/unknown requests are
+        idempotently dropped."""
         request = self.requests.get(request_id)
         if request is None or request.is_finished():
             # A late cloud result racing the request's own finish: the
             # books may still hold it if the finish path did not pass
             # through here (stale payload drop idempotent). Clean the
-            # account, or the leaked decode_load holds the gate forever.
+            # account, or leaked pending state holds the gate forever.
             self._lwd_settle_request(request_id)
             lwd_logger.warning(
                 "[edge-deliver] stale result for req=%s (not awaiting)",
                 request_id,
             )
             return False
-        self._lwd_settle_request(request_id, first_token=True)
         return True
 
-    def _lwd_settle_request(self, request_id: str, first_token: bool = False) -> None:
-        """Move load on delivery, or drop all request state on finish/abort.
-        Send watermarks alone release pending batches after first token."""
+    def _lwd_settle_request(self, request_id: str) -> None:
+        """Drop all request state on finish/abort. Send watermarks alone
+        release pending batches after the first token."""
         account = self._lwd_account_of(request_id)
         if account is None:
-            return
-        if first_token:
-            account.note_prefill_done(request_id)
             return
         refill_batches = {
             seqno: set(account.pending_batches[seqno])
@@ -1030,21 +1127,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         }
         account.drop_request(request_id)
         account.pending_batches.update(refill_batches)
-        was_awaiting = request_id not in account.prefill_requests
-        account.note_request_settled(request_id, was_awaiting)
         self._lwd_route.pop(request_id, None)
 
-    def _lwd_purge_mrope_positions(self) -> None:
-        """Reconcile and remove mrope positions: the request has left
-        requests (terminated/aborted) or finished embedding and
-        transitioned to decode phase (all chunks already sent, notify no
-        longer reads it). Resident models have no natural removal point of
-        "leave the queue on embedding completion", so the harvest phase
-        reconciles uniformly."""
-        for rid in list(self._lwd_mrope_positions_dict):
-            request = self.requests.get(rid)
-            if request is None or self._lwd_req_phase(request) is LwdReqPhase.DECODE:
-                self._lwd_mrope_positions_dict.pop(rid, None)
+    def _lwd_release_expired_admission_metadata(self) -> None:
+        """Release metadata whose request is gone or whose prefill is complete.
+
+        Resident requests remain in `self.requests` while waiting for cloud
+        decode, so request removal alone cannot reclaim admission metadata.
+        """
+        for request_id in self.lwd_model_family.held_request_ids():
+            request = self.requests.get(request_id)
+            prefill_finished = (
+                request is not None
+                and self._lwd_req_phase(request) is LwdReqPhase.DECODE
+            )
+            if request is None or prefill_finished:
+                self.lwd_model_family.release(request_id)
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject

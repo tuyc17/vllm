@@ -15,8 +15,9 @@ def init_model_state(
     model: nn.Module,
     encoder_cache: EncoderCache | None,
     device: torch.device,
+    model_state_cls: type[ModelState] | None = None,
 ) -> ModelState:
-    cls = resolve_model_state_cls(vllm_config, model)
+    cls = model_state_cls or resolve_model_state_cls(vllm_config, model)
 
     # Reject enable_prompt_embeds for states that would silently ignore it.
     if vllm_config.model_config.enable_prompt_embeds and not cls.supports_prompt_embeds:

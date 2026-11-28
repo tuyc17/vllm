@@ -90,6 +90,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+    image_placeholder_spans: list[int] = []
+    """Flattened `(start, length, token_id)` runs of image placeholder ids in
+    the whole prompt, for the cloud to rebuild the ids its image routing
+    reads. Empty for text-only prompts and models without them."""
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
@@ -99,13 +103,6 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     Native nonce negotiation ignores this field and uses its reservation. The
     gateway path must consume the same snapshot at this boundary (or discard a
     stale reservation for a fail-open zero hit), never renegotiate the hit.
-    """
-    prefix_probe_succeeded: bool = False
-    """Whether a gateway probe completed and created the matching reservation.
-
-    False also covers placement-only and fail-open. Keeping this separate from
-    a zero hit preserves the HMAC manifest/finish chain of successful cache
-    misses while allowing fail-open requests to discard stale reservations.
     """
     structured_outputs: str = ""
     """`lwd_encode_structured_outputs` wire JSON of the validated
@@ -158,6 +155,7 @@ def lwd_decode_structured_outputs(payload: str, params_cls: type[T]) -> T | None
 
     Raises:
         ValueError: The payload is not a well-formed envelope.
+
     """
     if not payload:
         return None
@@ -269,6 +267,8 @@ class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     hit_tokens: int
     nonce: int
     error: str = ""
+    replay_start: int = -1
+    """First prompt row the edge must send for bounded replay; -1 when absent."""
 
 
 class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -305,6 +305,20 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     """Generation of each request row, aligned with req_ids."""
 
 
+class LwdCloudHeartbeat(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Liveness keepalive of one cloud DP rank.
+
+    The edge keeps per-connection liveness accounts: no beat within the
+    silent threshold (the edge engine's ``LWD_HELLO_SILENT_S``) is a
+    silent verdict (the edge
+    tears the data-plane
+    links down and gates new requests until the next beat), and a
+    ``boot_id`` change is a cloud restart verdict. The boot id is random
+    per cloud process launch, i.e. the epoch of this DP rank."""
+
+    boot_id: str
+
+
 LwdEdgeToCloudMessage: TypeAlias = (
     LwdRequestNotify
     | LwdRangeNotify
@@ -313,7 +327,11 @@ LwdEdgeToCloudMessage: TypeAlias = (
     | LwdFinishNotify
 )
 LwdCloudToEdgeMessage: TypeAlias = (
-    LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
+    LwdCloudParamsNotify
+    | LwdCloudHeartbeat
+    | LwdC2eNotify
+    | LwdPrefixReadyNotify
+    | LwdRefillNotify
 )
 LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
 
@@ -331,6 +349,7 @@ def lwd_decode_edge_to_cloud(data: bytes | memoryview) -> LwdEdgeToCloudMessage:
     Raises:
         msgspec.DecodeError: Not valid msgpack.
         msgspec.ValidationError: Not an edge -> cloud message.
+
     """
     return _LWD_EDGE_TO_CLOUD_DECODER.decode(data)
 
@@ -341,5 +360,6 @@ def lwd_decode_cloud_to_edge(data: bytes | memoryview) -> LwdCloudToEdgeMessage:
     Raises:
         msgspec.DecodeError: Not valid msgpack.
         msgspec.ValidationError: Not a cloud -> edge message.
+
     """
     return _LWD_CLOUD_TO_EDGE_DECODER.decode(data)

@@ -33,6 +33,17 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 - **迁移/替换要一次做到位**: 替换一个模块后, 全仓 grep 旧设计的名字与术语 (类名、函数名、注释里的旧概念, 如 publish/HELLO/接收线程/`wire_version`), 残留的转发层、没人覆写的空默认实现、只为旧结构存在的辅助函数、过时注释, 与替换放在同一个 commit 里清掉, 不留到以后. 例: 控制面替换后删掉了 `_lwd_shutdown_comm` (失败清理已由基类 `shutdown` 统一承担) 与转发层 `_lwd_on_message`.
 
+## LWD MRV2 模块地图（实现候选）
+
+- `vllm/v1/worker/gpu/lwd/`：公共 V2 runner/state、按连接窗口注入、DOWN builder、MTP、penalties 与纯 torch 辅助组件。历史 V1 模块保持原位，未整体切换到这些新组件。
+- 多连接路由使用完整 `LwdConnectionId`；runner 从请求的逻辑 edge 身份解析本实例唯一连接。UP 按连接选择 `_lwd_up_src_ranks` 的真实 endpoint，lookahead 只广播本连接行；DOWN 返回带 connection 的 payload 列表，worker 继续使用 `lwd_down_carriers`。
+- UCX/host staging 沿用 `LwdWorkerBase._init_lwd_data_plane()` 与现有 stager，不恢复旧 HCCL 专用初始化。原生 waiting queue 与 structured output 已在新主线存在，MRV2 只补 lookahead 到达约束，不恢复旧队列。
+- Ascend 云端通用 Mamba hybrid 在 `lwd_cloud_model/v2/model_state.py` 组合 LWD 与 `AscendMambaHybridModelState`；DSV4.1 使用 `LwdAscendCloudEngramModelState` 组合 LWD 与 `EngramModelState`，基础 eager、DSpark 与 PIECEWISE/FULL 已接入但尚未真机验证，DSpark adaptive verification 仍拒绝；其他模型专用 state 的选择不变。
+- Ascend 边端在 `lwd_edge_execution.py` 共享 embed/unembed 直调执行，V2 只继承原生 V2 runner 与执行 mixin，不继承 V1 runner；空 KV 配置不进入通用 cache 分配。
+- `control_scheduler/lwd_base_engine.py` 与 `lwd_comm/`：engine/worker runner_kind 一致性检查及边云握手版本校验；缺省按 V1 处理，V1/V2 不混用。
+- 正式接口：`ModelState.compute_sample_logits()`/`capture_sample_logits()` 统一 logits 计算与捕获；runner 通过 `create_model_state()`、`create_speculator()` 和 state 类型映射选择实现，模型专用 state 优先，原生工厂不判断 `lwd_config`；异步输出通过 `AsyncModelRunnerOutput.get_model_runner_output()` 获取内部对象，EP fault 查询保持原生行为。
+- 当前状态：聚焦 CPU UT 已覆盖核心行为；新主线 910B/C 上的 eager/PIECEWISE/FULL、MTP、多连接、UCX/host 与 prefix/abort 场景尚未完成验证。设计见 `docs/design/lwd_model_runner_v2.md`。进入 PR 前必须补 RFC issue，暂不宣称新主线已支持 MRV2。
+
 ## LWD 命名约定 (团队规范 7.5 的细化)
 
 - **一个概念一个词, 跨类名/字段/方法/异常/日志/报错文案保持一致.** 例: 控制面里"对端完成握手、可以发送"统一叫 registered (`_registered_peers`, `LwdPeerNotRegisteredError`), 不混用 ready/connected/up; 只有成对的回调 `on_peer_up`/`on_peer_down` 例外.

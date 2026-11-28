@@ -1,0 +1,112 @@
+# Allowlist for tools/pre_commit/check_test_tethering.py
+#
+# Every path below is a test file that is collected by NO Buildkite job in any
+# pipeline yaml the checker parses (the job_dirs of .buildkite/ci_config*.yaml -
+# test_areas/, hardware_tests/, intel_jobs/ - plus .buildkite/test-amd.yaml).
+# These are pre-existing gaps, captured when the check was first added so that
+# the gate could start green. The list is meant to only ever shrink.
+#
+# Rules:
+#   * Every entry needs a trailing `# <reason>` on its own line saying why the
+#     test isn't wired into a job. A bare path is rejected by the check.
+#   * Do not add a new entry to unblock a PR without a real justification.
+#   * To remove an entry: add the test to a job's `commands` (and matching
+#     `source_file_dependencies`) in a .buildkite/ pipeline yaml, then delete the
+#     line.
+#   * `check_test_tethering.py --all` reports entries here that have since
+#     become tethered, and entries whose file no longer exists.
+
+# tests/distributed/ - multi-GPU / multi-node suites, launched via torchrun or a
+# custom runner rather than a directory-level pytest invocation.
+tests/distributed/aux_output_connector/test_store.py  # added by #45635 (2026-09-21), no job collects this path
+tests/distributed/test_dcp_a2a.py  # multi-GPU DCP all-to-all; no dir-level pytest job
+tests/distributed/test_eplb_events.py  # multi-GPU EPLB; no dir-level pytest job
+tests/distributed/test_eplb_fused_moe_layer.py  # multi-GPU EPLB; no dir-level pytest job
+tests/distributed/test_eplb_fused_moe_layer_dep_nvfp4.py  # multi-GPU EPLB nvfp4; no dir-level pytest job
+tests/distributed/test_eplb_quant_scale_consistency.py  # multi-GPU EPLB; no dir-level pytest job
+tests/distributed/test_expert_parallel.py  # multi-GPU expert parallel; no dir-level pytest job
+tests/distributed/test_expert_placement.py  # multi-GPU expert placement; no dir-level pytest job
+tests/distributed/test_file_store.py  # no distributed.yaml job collects this path
+tests/distributed/test_flashinfer_pcie_ipc_all_reduce.py  # multi-GPU PCIe IPC all-reduce (#53576); no job
+tests/distributed/test_kimi_linear_context_parallel.py  # multi-GPU context parallel; no dir-level pytest job
+tests/distributed/test_kv_cache_events.py  # needs multi-proc KV-events setup; no job
+tests/distributed/test_kvlayout.py  # no distributed.yaml job collects this path
+tests/distributed/test_mq_connect_ip.py  # no distributed.yaml job collects this path
+tests/distributed/test_pipeline_partition.py  # no distributed.yaml job collects this path
+tests/distributed/test_split_group.py  # no distributed.yaml job collects this path
+tests/distributed/test_weight_transfer_nccl_uid.py  # sibling test_weight_transfer.py is tethered; not added to that job (#53784)
+
+# tests/entrypoints/cli/
+tests/entrypoints/cli/test_serve.py  # added by #53124 (2026-09-15); no job collects tests/entrypoints/cli/
+
+# tests/kernels/
+tests/kernels/test_shuffle_rows.py  # explicitly --ignore'd in kernels.yaml with no follow-up job
+
+# tests/lora/ - explicitly --ignore'd from the sharded LoRA run, with no
+# dedicated *_tp job (unlike the other ignored *_tp tests).
+tests/lora/test_deepseekv2_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job
+tests/lora/test_qwen3moe_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job
+
+# tests/v1/ - the v1 subtree is otherwise covered by many `pytest v1/...` jobs.
+tests/v1/ec_connector/integration/test_epd_correctness.py  # run_epd_correctness_test.sh exists but no Buildkite job invokes it
+tests/v1/ec_connector/integration/test_nixl_failure.py  # 2-GPU + NIXL E/PD integration test (#55290); no Buildkite job collects ec_connector/integration/
+tests/v1/kv_connector/nixl_integration/test_disagg_accuracy.py  # run by intel_jobs/misc_intel.yaml's run_xpu_disagg_accuracy_test.sh, which names it via $EXP_ROOT (the script's own dir) - not statically resolvable
+
+# tests/platforms/
+tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platforms/
+
+# tests/tools/
+tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
+
+# Pre-existing LWD tests were not collected by an inherited Buildkite job.
+tests/distributed/test_lwd_parallel_groups.py  # pre-existing LWD suite not wired into CI
+tests/scripts/lwd/test_split_lwd_checkpoint.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_dp_account.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_prefix_engine.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_config.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_diag.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_plane_multi_link.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_executor_proxy.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_host_staging.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_picker.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_prefix_control.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_eos_trace.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_logger.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_messages.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_prefix_cache.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_public_surface.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_meta_embeds_transport.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_prompt_embeds_seam.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_worker_base_weave_guard.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_sock.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_ucx_shm.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_ucx_symbol_contract.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_lwd_ucx_state_log.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_control_bridge.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_dp_wave.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_health.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_client.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_probe.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_route_rotation.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_scheduler.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_frontend_routing.py  # pre-existing LWD suite not wired into CI
+
+# LWD fast-lane unit tests ported to the new main in #117. These are CPU-only
+# module tests exercised by the LWD Fast workflow and local pytest; no
+# Buildkite directory-level job collects these paths (same as the LWD suites
+# already listed above). Wire them into Buildkite before removing an entry.
+tests/config/lwd/test_topology_update.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_frontend_attach_reregister.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_lwd_async_client.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_comm/test_lwd_ucx_listener.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_cloud_engine_retire.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_control_plane_add_link.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_edge_cloud_adoption.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_edge_hello_reregister.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_handshake_allow_edge.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_heartbeat.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_liveness.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_topology_watch.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_transfer_containment.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_liveness_gateway.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_frontend_attach_startup.py  # LWD fast-lane UT; no Buildkite job collects this path

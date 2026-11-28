@@ -31,6 +31,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdPrefixReadyNotify,
     LwdRefillNotify,
 )
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdModelFamily
 
 
 class _Request(SimpleNamespace):
@@ -159,7 +160,7 @@ def _refill_scheduler(send: Mock) -> LwdEdgeScheduler:
     scheduler._lwd_route = {"r": 1}
     scheduler._lwd_pending_refills = deque()
     scheduler._lwd_announced_refills = set()
-    scheduler._lwd_mrope_positions_dict = {}
+    scheduler.lwd_model_family = LwdModelFamily()
     scheduler._lwd_aborted_req_ids = {0: [], 1: []}
     scheduler._lwd_chunk_unit = 4
     scheduler.scheduler_config = SimpleNamespace(max_num_batched_tokens=3)
@@ -298,6 +299,21 @@ def test_invalid_ready_hit_is_rejected_without_raising() -> None:
     assert request.num_computed_tokens == 0
     assert scheduler.lwd_edge_prefix_ready(request, 8)
     assert request.num_computed_tokens == 8
+
+
+def test_replay_start_controls_initial_prompt_offset() -> None:
+    scheduler = object.__new__(LwdEdgeScheduler)
+    scheduler._lwd_prefix_hash_block_size = 4
+    request = _request()
+
+    assert scheduler.lwd_edge_prefix_ready(request, 8, 4)
+    assert request.num_computed_tokens == 4
+    assert request.replay_start == 4
+
+    legacy_request = _request()
+    assert scheduler.lwd_edge_prefix_ready(legacy_request, 8)
+    assert legacy_request.num_computed_tokens == 8
+    assert getattr(legacy_request, "replay_start", 0) == 0
 
 
 def _engine_request(request_id: str = "r") -> SimpleNamespace:

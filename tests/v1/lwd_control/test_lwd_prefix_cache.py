@@ -8,13 +8,17 @@ import pytest
 
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+    LwdCloudEngineCore,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     LwdPrefixReservations,
     LwdProbeQueryAdapter,
+    _lwd_check_cacheable_specs,
     init_lwd_prefix_cache,
     prefix_start,
 )
@@ -470,3 +474,49 @@ def test_protocol_mm_abi_validation_matrix() -> None:
         )
         == local_abi
     )
+
+
+def test_prefix_validation_ignores_non_cacheable_groups() -> None:
+    cacheable = object.__new__(FullAttentionSpec)
+    ring = object.__new__(CircularBufferSpec)
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=ring),
+            SimpleNamespace(kv_cache_spec=cacheable),
+        ]
+    )
+
+    assert _lwd_check_cacheable_specs(config) == [cacheable]
+
+
+def test_prefix_validation_rejects_when_no_group_is_cacheable() -> None:
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=object.__new__(CircularBufferSpec))
+        ]
+    )
+
+    with pytest.raises(ValueError, match="at least one prefix-cacheable"):
+        _lwd_check_cacheable_specs(config)
+
+
+def test_ready_replay_start_matches_native_window() -> None:
+    engine = object.__new__(LwdCloudEngineCore)
+    engine.scheduler = SimpleNamespace(connector=None, prefix_replay_tokens=128)
+
+    assert engine._lwd_prefix_replay_start(SimpleNamespace(), 512) == 384
+    assert engine._lwd_prefix_replay_start(SimpleNamespace(), 64) == 0
+
+    engine.scheduler.prefix_replay_tokens = 0
+    assert engine._lwd_prefix_replay_start(SimpleNamespace(), 512) == 512
+
+
+def test_ready_replay_start_is_not_reduced_when_window_is_loaded() -> None:
+    engine = object.__new__(LwdCloudEngineCore)
+    engine.scheduler = SimpleNamespace(
+        connector=object(),
+        prefix_replay_tokens=128,
+        _load_restores_replay_window=lambda _request: True,
+    )
+
+    assert engine._lwd_prefix_replay_start(SimpleNamespace(), 512) == 512

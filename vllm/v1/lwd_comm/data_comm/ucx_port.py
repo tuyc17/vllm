@@ -608,7 +608,7 @@ class LwdUcxDaemonPort:
             self._wake_daemon()
 
     def _dispatch_loop(self) -> None:
-        """cpl dispatch + recv block recycling (single dispatcher thread,
+        """Cpl dispatch + recv block recycling (single dispatcher thread,
         cpl FIFO order preserved)."""
         while not self._stopped:
             ready, _, _ = select.select([self._wake_engine_r], [], [], 0.05)

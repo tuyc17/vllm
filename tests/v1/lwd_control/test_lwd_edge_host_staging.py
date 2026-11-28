@@ -19,6 +19,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdAbortNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdMropeModelFamily
 
 DP0 = LwdConnectionId(0, 0, 0)
 DP1 = LwdConnectionId(0, 0, 1)
@@ -32,7 +33,8 @@ def _scheduler() -> LwdEdgeScheduler:
     }
     scheduler._lwd_aborted_req_ids = {DP0: [], DP1: []}
     scheduler._lwd_route = {}
-    scheduler._lwd_mrope_positions_dict = {}
+    scheduler.lwd_model_family = object.__new__(LwdMropeModelFamily)
+    scheduler.lwd_model_family._positions = {}
     scheduler._lwd_pending_refills = ()
     scheduler.lwd_has_pending = None
     scheduler.unembed_notify_queue = ()
@@ -75,7 +77,6 @@ def test_pending_up_send_keeps_empty_steps_alive_until_watermark_arrives() -> No
 def test_announced_refill_survives_settlement_until_watermark() -> None:
     scheduler = _scheduler()
     account = scheduler._lwd_accounts[DP0]
-    account.note_prefill_admitted("r1")
     account.register_batch(3, {"r1"})
     scheduler._lwd_route["r1"] = DP0
     scheduler._lwd_announced_refills = {(DP0, 3)}
@@ -90,25 +91,21 @@ def test_announced_refill_survives_settlement_until_watermark() -> None:
 def test_first_token_keeps_pending_but_finish_releases_request() -> None:
     scheduler = _scheduler()
     account = scheduler._lwd_accounts[DP0]
-    account.note_prefill_admitted("r1")
     account.register_batch(0, {"r1"})
     scheduler._lwd_route["r1"] = DP0
     scheduler.requests["r1"] = SimpleNamespace(is_finished=lambda: False)
 
     assert scheduler.lwd_edge_deliver_tokens("r1", [7], finished=False)
     assert account.pending_chunks() == 1
-    assert (account.prefill_load, account.decode_load) == (0, 1)
 
     scheduler._lwd_settle_request("r1")
     assert account.pending_chunks() == 0
-    assert account.load == 0
 
 
 def test_abort_returns_original_routes_and_queues_worker_notice() -> None:
     scheduler = _scheduler()
     for request_id, connection in (("r1", DP1), ("r2", DP0)):
         scheduler._lwd_route[request_id] = connection
-        scheduler._lwd_accounts[connection].note_prefill_admitted(request_id)
 
     routed = scheduler.lwd_edge_abort(["r1", "r2", "unknown"])
 
@@ -137,7 +134,7 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
             return b"full-prompt"
 
     scheduler = _scheduler()
-    scheduler._lwd_mrope_positions_dict["r1"] = Positions()
+    scheduler.lwd_model_family._positions["r1"] = Positions()
     scheduler.requests["r1"] = SimpleNamespace(
         num_computed_tokens=5,
         prompt_token_ids=[0, 1, 2, 3, 4],
@@ -154,22 +151,36 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
     assert scheduler.lwd_mrope_positions("r1") == b"full-prompt"
 
 
-def test_prefill_cap_does_not_reserve_inflight_spec_tokens() -> None:
+def test_prefill_uses_full_token_budget_with_decode_requests() -> None:
     scheduler = _scheduler()
     scheduler.max_num_scheduled_tokens = 128
     scheduler.max_num_running_reqs = 16
-    scheduler._lwd_accounts[DP0].prefill_load = 12
     scheduler._lwd_chunk_unit = 128
-    scheduler.running = []
-    scheduler.skipped_waiting = []
+    scheduler._lwd_route = {"r1": DP0, "r2": DP0}
+    scheduler.running = [
+        SimpleNamespace(
+            request_id="r1",
+            num_prompt_tokens=128,
+            num_computed_tokens=0,
+            is_finished=lambda: False,
+        ),
+        SimpleNamespace(
+            request_id="r2",
+            num_prompt_tokens=8,
+            num_computed_tokens=8,
+            is_finished=lambda: False,
+        ),
+    ]
+    scheduler.kv_holding_waiting = []
     scheduler.waiting = []
     scheduler.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="test"))
     )
 
-    _, _, cap = scheduler._lwd_pick_prefill_batch(DP0)
+    req_ids, expected = scheduler._lwd_pick_prefill_batch(DP0)
 
-    assert cap == 128
+    assert req_ids == ["r1"]
+    assert expected == {"r1": 128}
 
 
 def test_engine_sends_abort_to_original_dp(monkeypatch) -> None:

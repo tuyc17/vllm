@@ -2,7 +2,7 @@ name: LWD Fast
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, releases/v0.30.0]
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
@@ -19,4 +19,4 @@ jobs:
     with:
       upstream_repo: vllm-project/vllm
       source_roots: vllm/
-      pre_commit_skip: mypy-3.10
+      pre_commit_skip: mypy

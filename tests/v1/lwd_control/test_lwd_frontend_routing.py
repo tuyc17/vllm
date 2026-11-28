@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from vllm.config.lwd import LwdAPIConfig, LwdConfig, LwdTopology
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdModelFamily
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VLLM_DIR = REPO_ROOT / "vllm"
@@ -388,18 +389,10 @@ class _Account:
     def __init__(self, connection_id: tuple[str, int, int]) -> None:
         self.connection_id = connection_id
         self.pending_batches = {}
-        self.prefill_requests = set()
         self.dropped = []
 
     def drop_request(self, request_id: str) -> None:
-        self.prefill_requests.discard(request_id)
         self.dropped.append(request_id)
-
-    def note_request_settled(self, request_id: str, was_awaiting: bool) -> None:
-        pass
-
-    def note_prefill_done(self, request_id: str) -> None:
-        pass
 
 
 _CONNECTION = ("cloud", 0, 0)
@@ -415,15 +408,12 @@ class _SchedBase:
         self._lwd_route = {}
         self._lwd_accounts = {_CONNECTION: _Account(_CONNECTION)}
         self._lwd_req_id_to_client = {}
-        self._lwd_mrope_positions_dict = {}
+        self.lwd_model_family = LwdModelFamily()
         self._lwd_pending_refills = deque()
         self._lwd_aborted_req_ids = {_CONNECTION: []}
         self._lwd_announced_refills = set()
 
     def _lwd_validate_request(self, request: NS) -> None:
-        pass
-
-    def _lwd_compute_mrope_positions(self, request: NS) -> None:
         pass
 
     def _lwd_route_request(self, request_id: str) -> tuple[str, int, int]:
@@ -440,7 +430,7 @@ class _SchedBase:
     def _lwd_watermark_connection(self, key: Any) -> Any:
         return key
 
-    def _lwd_purge_mrope_positions(self) -> None:
+    def _lwd_release_expired_admission_metadata(self) -> None:
         pass
 
     def finish_requests(self, request_ids: list[str], status: object = None) -> None:

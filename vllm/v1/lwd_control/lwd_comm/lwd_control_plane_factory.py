@@ -16,6 +16,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdEdgeControlPlane,
     LwdEdgeControlPlaneSpec,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdRunnerKind
 
 # The topology address may be unreachable from inside the host (NAT,
 # containers), so the cloud binds every interface of the address family.
@@ -24,7 +25,10 @@ _LWD_IPV6_ANY = "::"
 
 
 def lwd_create_control_plane(
-    lwd_config: LwdConfig, dp_rank: int, dp_size: int
+    lwd_config: LwdConfig,
+    dp_rank: int,
+    dp_size: int,
+    runner_kind: LwdRunnerKind = "v1",
 ) -> LwdControlPlane:
     """Create, not start, the control plane of this engine's DP rank.
 
@@ -34,15 +38,21 @@ def lwd_create_control_plane(
         dp_size: Global DP size. Non-MoE engine processes reset
             `ParallelConfig.data_parallel_size` to 1 before the engine is
             built, so read it before that.
+        runner_kind: Model runner generation shared by the edge and cloud.
 
     Raises:
         ValueError: `dp_size` or `dp_rank` does not match the topology or
             the role.
+
     """
     _lwd_validate_dp(lwd_config, dp_rank, dp_size)
     if lwd_config.role == "cloud":
-        return LwdCloudControlPlane(_lwd_cloud_spec(lwd_config, dp_rank, dp_size))
-    return LwdEdgeControlPlane(_lwd_edge_spec(lwd_config, dp_rank, dp_size))
+        return LwdCloudControlPlane(
+            _lwd_cloud_spec(lwd_config, dp_rank, dp_size, runner_kind)
+        )
+    return LwdEdgeControlPlane(
+        _lwd_edge_spec(lwd_config, dp_rank, dp_size, runner_kind)
+    )
 
 
 def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
@@ -70,7 +80,10 @@ def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
 
 
 def _lwd_cloud_spec(
-    lwd_config: LwdConfig, dp_rank: int, dp_size: int
+    lwd_config: LwdConfig,
+    dp_rank: int,
+    dp_size: int,
+    runner_kind: LwdRunnerKind,
 ) -> LwdCloudControlPlaneSpec:
     local = lwd_config.instance.dp[dp_rank]
     assert local.ctrl_port is not None, "topology requires ctrl_port on clouds"
@@ -88,11 +101,15 @@ def _lwd_cloud_spec(
                 if c.connection_id.dp_idx == dp_rank
             )
         ),
+        runner_kind=runner_kind,
     )
 
 
 def _lwd_edge_spec(
-    lwd_config: LwdConfig, dp_rank: int, dp_size: int
+    lwd_config: LwdConfig,
+    dp_rank: int,
+    dp_size: int,
+    runner_kind: LwdRunnerKind,
 ) -> LwdEdgeControlPlaneSpec:
     """Endpoints of the cloud DP ranks this edge engine connects to.
 
@@ -115,4 +132,5 @@ def _lwd_edge_spec(
             cloud_dp_sizes[c.connection_id.cloud_id] for c in connections
         ),
         config=lwd_config.topology.control_plane,
+        runner_kind=runner_kind,
     )

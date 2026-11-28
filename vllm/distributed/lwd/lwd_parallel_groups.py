@@ -10,9 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vllm.config.engram import model_has_engram_layers
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.lwd import LwdConnectionId, LwdTopology
+    from vllm.config.lwd.topology import LwdDP
 
 LwdRankGroup = tuple[int, ...]
 
@@ -51,6 +54,14 @@ class LwdParallelGroupsSpec:
     dp_groups: tuple[LwdRankGroup, ...]
     """One group per co-located cloud rank across the DPs of its instance;
     singletons when every instance has one DP. Used by MoE engines only."""
+    engram_dp_groups: tuple[LwdRankGroup, ...]
+    """The host-local part of each DP group: one group per co-located rank
+    and host, joining the DP replicas of that position placed on that host.
+
+    An Engram table is held by the replicas of one host, which map one copy
+    of it instead of one each. Replicas on different hosts cannot share
+    memory, so they fall in different groups; with one replica per host every
+    group is a singleton and each host holds a table of its own."""
     ep_groups: tuple[LwdRankGroup, ...]
     """Expert-parallel groups: one per edge instance, one per cloud instance
     spanning all its DPs' ranks. Equals tp_groups at one DP per instance."""
@@ -63,6 +74,7 @@ class LwdParallelGroupsSpec:
 
         Raises:
             ValueError: Allocations of distinct instances or DPs overlap.
+
         """
         scene = topology.deployment.scene
         # 1. One allocation per edge instance (its DPs share its ranks: one
@@ -116,6 +128,13 @@ class LwdParallelGroupsSpec:
             for cloud in topology.clouds
             for position in range(len(cloud.dp[0].ranks))
         ]
+        # 3b. Engram groups are the host-local part of the DP groups: only
+        # co-located replicas can map one table instead of one each.
+        engram_dp_groups: list[LwdRankGroup] = [
+            (rank,) for edge in edge_instances for rank in edge.dp[0].ranks
+        ]
+        for cloud in topology.clouds:
+            engram_dp_groups += _lwd_host_local_groups(cloud.dp)
         # 4. EP groups: experts sharded dp x tp over each cloud instance, as
         # natively; the edge holds no experts but joins a group so every
         # rank is covered.
@@ -135,6 +154,7 @@ class LwdParallelGroupsSpec:
             world_size=world_size,
             tp_groups=tuple(sorted((*edge_allocations, *cloud_allocations))),
             dp_groups=tuple(dp_groups),
+            engram_dp_groups=tuple(engram_dp_groups),
             ep_groups=tuple(ep_groups),
             channel_endpoints=tuple(channel_endpoints),
         )
@@ -148,6 +168,25 @@ class LwdParallelGroupsSpec:
             if rank in group:
                 return group
         raise ValueError(f"[LWD] rank {rank} is not in [0, {self.world_size})")
+
+    def dp_group_of(self, rank: int) -> LwdRankGroup:
+        return self._group_of(self.dp_groups, rank, "DP")
+
+    def engram_dp_group_of(self, rank: int) -> LwdRankGroup:
+        return self._group_of(self.engram_dp_groups, rank, "Engram DP")
+
+    def ep_group_of(self, rank: int) -> LwdRankGroup:
+        return self._group_of(self.ep_groups, rank, "EP")
+
+    def _group_of(
+        self, groups: tuple[LwdRankGroup, ...], rank: int, kind: str
+    ) -> LwdRankGroup:
+        for group in groups:
+            if rank in group:
+                return group
+        raise ValueError(
+            f"[LWD] rank {rank} is in no {kind} group of [0, {self.world_size})"
+        )
 
     def channel_endpoints_of(self, rank: int) -> tuple[LwdChannelEndpoints, ...]:
         """The channel pairs this rank holds; empty for non-endpoint ranks."""
@@ -165,13 +204,17 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     before any worker joins the world.
 
     Raises:
-        NotImplementedError: A parallel feature or the topology is unsupported.
+        NotImplementedError: A parallel feature, the topology or the Engram
+            placement is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance, or a host edge enables tensor parallelism.
+            of the local instance, a host edge enables tensor parallelism, or
+            co-located cloud replicas do not share their Engram table.
+
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
     parallel_config = vllm_config.parallel_config
+    engram_config = vllm_config.engram_config
     unsupported = [
         name
         for name, enabled in (
@@ -185,7 +228,10 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
                 parallel_config.decode_context_parallel_size > 1,
             ),
             ("elastic EP", parallel_config.enable_elastic_ep),
-            ("Engram", vllm_config.engram_config is not None),
+            (
+                "Engram embedding_across_dp",
+                engram_config is not None and engram_config.embedding_across_dp,
+            ),
         )
         if enabled
     ]
@@ -206,7 +252,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         # rank-allocation checks below do not apply.
         return
     # Raises for topologies the shared HCCL world cannot host.
-    LwdParallelGroupsSpec.from_topology(lwd_config.topology)
+    spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     # The topology gives every DP of an instance the same rank count.
     dp_ranks = lwd_config.instance.dp[0].ranks
     if parallel_config.tensor_parallel_size != len(dp_ranks):
@@ -215,3 +261,72 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             f"!= {len(dp_ranks)} ranks per DP of {lwd_config.role} instance "
             f"{lwd_config.instance_id}"
         )
+    if lwd_config.role == "cloud":
+        _lwd_check_engram_sharing(vllm_config, spec)
+
+
+def _lwd_host_local_groups(dps: tuple[LwdDP, ...]) -> list[LwdRankGroup]:
+    """Group the DP replicas of one instance by co-located rank and host.
+
+    Native derives the same grouping from rank numbering, because a
+    centralized deployment has only ranks to go by: it takes the greatest
+    divisor of the DP count that keeps replicas whole within a node, then
+    verifies the node boundaries with `in_the_same_node_as`
+    (`_engram_dp_shard_size`). A topology names the host of every DP, so the
+    address is the node identity and the grouping is direct.
+
+    Groups of one host may differ in size from those of another, which the
+    native shard size, a single number for the whole deployment, cannot
+    express.
+    """
+    by_host: dict[str, list[LwdRankGroup]] = {}
+    for dp in dps:
+        by_host.setdefault(dp.addr, []).append(dp.ranks)
+    return [
+        tuple(sorted(replicas))
+        for replicas_of_host in by_host.values()
+        for replicas in zip(*replicas_of_host)
+    ]
+
+
+def _lwd_check_engram_sharing(
+    vllm_config: VllmConfig, spec: LwdParallelGroupsSpec
+) -> None:
+    """Require `dp_shared_memory` for co-located cloud DP replicas.
+
+    A singleton Engram DP group splits its table by TP alone and returns early.
+    A larger group must map one host table with `dp_shared_memory=True`;
+    otherwise each replica shards it again over `TP x Engram DP`. Four replicas
+    of four ranks produce 16 shards of 24 hash columns, which the table rejects
+    for uneven heads. Sharing also avoids one pinned-table copy per replica.
+
+    The flag is required explicitly because Ascend may resolve its default after
+    this check, with sharing off.
+
+    Raises:
+        ValueError: Co-located DP replicas serve Engram without
+            `dp_shared_memory`.
+
+    """
+    model_config = vllm_config.model_config
+    if model_config is None or not model_has_engram_layers(model_config):
+        return
+    lwd_config = vllm_config.lwd_config
+    assert lwd_config is not None
+    shared = max(
+        len(spec.engram_dp_group_of(rank))
+        for dp in lwd_config.instance.dp
+        for rank in dp.ranks
+    )
+    if shared == 1:
+        return
+    engram_config = vllm_config.engram_config
+    if engram_config is not None and engram_config.dp_shared_memory:
+        return
+    raise ValueError(
+        f"[LWD] {shared} data parallel replicas of {lwd_config.role} instance "
+        f"{lwd_config.instance_id} share a host, which needs --engram-config "
+        '\'{"cpu_offload":true,"dp_shared_memory":true}\': co-located replicas '
+        "map one Engram table instead of splitting it over tensor parallel x "
+        "Engram data parallel shards"
+    )

@@ -20,15 +20,17 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
 import msgspec
 import torch
 
-from vllm.config.lwd import LwdConnectionId
+from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
@@ -47,12 +49,17 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdCloudControlPlane,
+    LwdPeerNotRegisteredError,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
     LwdC2eNotify,
+    LwdCloudHeartbeat,
     LwdCloudParamsNotify,
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
@@ -73,6 +80,20 @@ from vllm.v1.request import Request
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
+# Seconds between one cloud DP's liveness heartbeats to its edges. This
+# cadence and the edge's silent threshold (LWD_HELLO_SILENT_S in
+# lwd_edge_engine) are the two halves of ONE liveness contract — the
+# sender's pace and the judge's threshold — so any change must consider
+# both files together.
+LWD_HELLO_INTERVAL_S = 1.0
+
+
+class _LwdHeartbeatTick:
+    """Input-queue sentinel of the heartbeat thread: the engine thread (the
+    control sender's owner) sends one liveness beat on receipt."""
+
+
+_LWD_HEARTBEAT_TICK = _LwdHeartbeatTick()
 
 
 def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
@@ -284,6 +305,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         lwd_logger.info(
             "[LWD][cloud] engine assembled: control plane on %s", plane.endpoint
         )
+        # Liveness epoch (peer-restart line): random per process launch; the
+        # edge treats a change of it as "this cloud DP restarted".
+        self._lwd_boot_id = uuid.uuid4().hex[:16]
+        self._lwd_hello_interval_s = LWD_HELLO_INTERVAL_S
+        self._lwd_last_heartbeat_at = 0.0
+        self._lwd_heartbeat_stop = threading.Event()
+        threading.Thread(
+            target=self._lwd_heartbeat_thread,
+            name="lwd-cloud-heartbeat",
+            daemon=True,
+        ).start()
 
     def _lwd_dp_coordinator_addr(self) -> str:
         """Routable coordinator stats endpoint, or empty without one."""
@@ -304,6 +336,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
         self._lwd_edges.add(peer)
+        # A (re)registered edge is a NEW process incarnation: its seqno
+        # streams restart from zero, so the connection's old-incarnation
+        # bookkeeping must not gate the new one. _lwd_latest_seqnos kept
+        # the old stream's high-water mark, dropping the new stream's
+        # first RangeNotify as a "duplicate" — the request hung with its
+        # UP frame already sent and nothing posted to receive it. (This
+        # callback fires only for a fresh registration or a session
+        # replacement, never for the same process's retried hellos, so
+        # the reset cannot fire on a mere link blip.)
+        connection = self._lwd_connection_of(peer)
+        self._lwd_ledger.latest_seqnos.pop(connection, None)
+        self._lwd_ledger.pending_seqnos.pop(connection, None)
         self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
             "[LWD][cloud] edge %s registered; scheduling limits sent: %s",
@@ -316,33 +360,73 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     ) -> None:
         """Retry a full outbound queue until the message is queued; gives up
         with an error once shutdown is requested, so a stalled edge cannot
-        block it."""
-        while not self._lwd_send(peer, message):
-            if self.shutdown_state != EngineShutdownState.RUNNING:
-                lwd_logger.error(
-                    "[LWD][cloud] %s to edge %s dropped: shutting down with the "
-                    "outbound queue full",
-                    type(message).__name__,
-                    peer,
-                )
-                return
-            time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        block it. An unregistered peer (its ROUTER is gone and the plane
+        already drops its payloads) drops the message instead of failing
+        the engine: the restarted edge's state is fresh and the stale
+        message has no receiver."""
+        try:
+            while not self._lwd_send(peer, message):
+                if self.shutdown_state != EngineShutdownState.RUNNING:
+                    lwd_logger.error(
+                        "[LWD][cloud] %s to edge %s dropped: shutting down "
+                        "with the outbound queue full",
+                        type(message).__name__,
+                        peer,
+                    )
+                    return
+                time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        except LwdPeerNotRegisteredError:
+            lwd_logger.error(
+                "[LWD][cloud] %s to edge %s dropped: peer unreachable",
+                type(message).__name__,
+                peer,
+            )
+            return
         _lwd_log_sent_to_edge(peer, message)
+
+    def _lwd_prefix_replay_start(self, request: Request, hit_tokens: int) -> int:
+        connector = self.scheduler.connector
+        if hit_tokens <= 0 or (
+            connector is not None
+            and self.scheduler._load_restores_replay_window(request)
+        ):
+            return hit_tokens
+        replay_tokens = getattr(self.scheduler, "prefix_replay_tokens", 0)
+        return hit_tokens - min(hit_tokens, replay_tokens)
 
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
     ) -> None:
         peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
-            raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
+            # The edge aborted this generation (or its connection failed)
+            # after the route was retired: a cancelled request has no reply
+            # destination. Reaching here means a route outlived its
+            # generation, which add_request's entry guard should have caught;
+            # log at error to surface that invariant break.
+            lwd_logger.error(
+                "[LWD][prefix] drop READY req=%s nonce=%d: generation already retired",
+                request_id,
+                nonce,
+            )
+            return
+        request = self.scheduler.requests.get(request_id)
+        replay_start = (
+            self._lwd_prefix_replay_start(request, hit_tokens)
+            if request is not None
+            else hit_tokens
+        )
         self._lwd_send_until_queued(
             peer,
-            LwdPrefixReadyNotify(unwrap_req_id(request_id), hit_tokens, nonce, error),
+            LwdPrefixReadyNotify(
+                unwrap_req_id(request_id), hit_tokens, nonce, error, replay_start
+            ),
         )
         lwd_logger.info(
-            "[LWD][prefix] READY req=%s hit=%d nonce=%d error=%r",
+            "[LWD][prefix] READY req=%s hit=%d replay_start=%d nonce=%d error=%r",
             request_id,
             hit_tokens,
+            replay_start,
             nonce,
             error,
         )
@@ -352,7 +436,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     ) -> None:
         peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
-            raise RuntimeError(f"[LWD] refill route missing for {request_id}")
+            # Same abort-before-send race as READY: the generation was already
+            # retired, so there is no edge to refill. Log at error to surface
+            # a route that outlived its generation.
+            lwd_logger.error(
+                "[LWD][prefix] drop REFILL req=%s nonce=%d: generation already retired",
+                request_id,
+                prefix_nonce,
+            )
+            return
         self._lwd_send_until_queued(
             peer,
             LwdRefillNotify(
@@ -382,6 +474,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         nonce = getattr(request, "lwd_prefix_nonce", 0)
+        request_id = request.request_id
+        if self._lwd_ledger.consume_stale_add(request_id, nonce):
+            # The edge aborted this generation after its RequestNotify but
+            # before this queued ADD was consumed: never resurrect it.
+            lwd_logger.info(
+                "[LWD][cloud] drop stale ADD req=%s nonce=%d: generation "
+                "already aborted",
+                request_id,
+                nonce,
+            )
+            return
+        if request_id not in self._lwd_ledger.request_routes:
+            # Every legitimate ADD follows a RequestNotify that registered the
+            # route; a missing route with no abort tombstone is a wiring bug.
+            raise RuntimeError(f"[LWD] ADD without a request route: {request_id}")
         if not self._lwd_prefix_enabled:
             super().add_request(request, request_wave)
             self._lwd_publish_usage_start(request)
@@ -389,11 +496,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if not nonce:
             lwd_logger.error(
                 "[LWD][prefix] reject req=%s: missing prefix nonce",
-                request.request_id,
+                request_id,
             )
             return
 
-        request_id = request.request_id
         if request_id in getattr(self.scheduler, "requests", {}):
             self._lwd_send_prefix_ready(
                 request_id, 0, nonce, error="duplicate active request id"
@@ -480,6 +586,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, _LwdHeartbeatTick
+        ):
+            # Engine thread (the sender's owner): one liveness beat per
+            # interval. The tick comes from the heartbeat thread, which only
+            # touches the input queue — the control sender is bound to this
+            # thread and an idle engine must still step for the beat.
+            self._lwd_send_heartbeat_if_due()
+            return
         if (
             request_type == EngineCoreRequestType.WAKEUP
             and isinstance(request, tuple)
@@ -549,6 +664,155 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         return LwdConnectionId(
             peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
         )
+
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
+        """C-2/C-3/C-4: admit each new edge to the handshake allowlist,
+        build its data-plane pair on the shared listener, and wire its
+        hint/done MQ pair. The rest of the join is the existing runtime
+        machinery — registration resets the seqno ledgers and resends
+        the scheduling limits, the heartbeat fan-out picks the peer up
+        from `_lwd_edges`. A data-plane or MQ refusal keeps the edge
+        control-plane only; the next detected increment retries.
+        Idempotent per edge and per connection: replays do not disturb
+        the live allowlist, the listener's route table or the MQs."""
+        plane = self._lwd_control_plane
+        assert isinstance(plane, LwdCloudControlPlane)
+        # In lwd_cluster each cloud engine serves only its own instance's
+        # connections (other cloud engines watch the same file and apply
+        # their own). In cloud_share every new connection goes to the
+        # single shared cloud, but a shared cloud with multiple DP ranks
+        # runs one engine per DP: each engine must adopt only its own
+        # DP's connections (the same per-DP filter as __init__), or every
+        # engine extends worker state with the other DPs' connection ids
+        # and the runner's per-edge connection resolution loses
+        # uniqueness.
+        my_connections = [
+            connection
+            for connection in increment.new_connections
+            if connection.connection_id.cloud_id == self.lwd_config.instance_id
+            and connection.connection_id.dp_idx
+            == self.vllm_config.parallel_config.data_parallel_index
+        ]
+        for edge_id in increment.new_edge_ids:
+            # Only admit edges that connect to THIS cloud.
+            if not any(
+                c.connection_id.edge_id == edge_id
+                and c.connection_id.cloud_id == self.lwd_config.instance_id
+                for c in my_connections
+            ):
+                continue
+            plane.allow_edge(edge_id)
+            lwd_logger.error(
+                "[LWD][cloud] edge %d admitted to the handshake allowlist "
+                "(topology increment)",
+                edge_id,
+            )
+        for connection in my_connections:
+            # The UCX listener, token route table and IO registry live in
+            # the WORKER processes (MultiprocExecutor); the data-plane
+            # hook registry is process-local and empty in the EngineCore.
+            # Build via collective_rpc: the endpoint Worker (the one
+            # that owns the shared listener) does the work, others return
+            # None (not their job, distinct from False = refused).
+            results = self.model_executor.collective_rpc(
+                "lwd_build_runtime_connection", args=(connection,)
+            )
+            built = any(result is True for result in results)
+            if not built:
+                lwd_logger.error(
+                    "[LWD] data-plane build refused for %s; the edge's UP "
+                    "frames will keep retrying the listener (retried on "
+                    "the next topology change)",
+                    connection.connection_id,
+                )
+                continue
+            lwd_logger.error(
+                "[LWD] runtime connection %s built (serve pair on the shared listener)",
+                connection.connection_id,
+            )
+            self._lwd_wire_runtime_hint_mq(connection.connection_id)
+
+    def _lwd_wire_runtime_hint_mq(self, connection: LwdConnectionId) -> None:
+        """C-4: wire one runtime connection's hint/done MQ pair — the
+        engine creates the hint MQ, registers the hint sender, RPCs the
+        worker to attach/create the per-connection MQs (passing the hint
+        MQ's handle explicitly: env vars do NOT cross the process
+        boundary in MultiprocExecutor at runtime — they only work at
+        startup where workers inherit the engine's env), and stores the
+        returned done MQ handle for the drain loop. Idempotent: an
+        already-wired connection skips. A failed attempt rolls back its
+        local resources so a later topology increment can retry."""
+        if connection in self._lwd_hint_mqs:
+            return
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            _encode_handle,
+            _hint_senders,
+            create_hint_mq,
+            register_hint_sender,
+        )
+
+        hint_mq = None
+        done_mq = None
+        sender = None
+        previous_sender = _hint_senders.get(connection)
+        try:
+            hint_mq = create_hint_mq(connection)
+
+            def send_hint(hint: dict[str, Any], mq: Any = hint_mq) -> None:
+                mq.enqueue(hint)
+
+            sender = send_hint
+            register_hint_sender(sender, connection)
+            hint_handle_str = _encode_handle(hint_mq.export_handle())
+            handles = [
+                handle
+                for handle in self.model_executor.collective_rpc(
+                    "lwd_attach_runtime_connection_mqs",
+                    args=(connection, hint_handle_str),
+                )
+                if handle is not None
+            ]
+            if len(handles) != 1:
+                lwd_logger.error(
+                    "[LWD] runtime MQ wiring failed for %s: expected one "
+                    "endpoint worker to report a done MQ handle, got %d; "
+                    "rolling back for a later topology increment to retry",
+                    connection,
+                    len(handles),
+                )
+            else:
+                from vllm.distributed.device_communicators.shm_broadcast import (
+                    MessageQueue,
+                )
+
+                done_mq = MessageQueue.create_from_handle(handles[0], 0)
+        except Exception:
+            lwd_logger.exception(
+                "[LWD] runtime MQ wiring failed for %s; rolling back for "
+                "a later topology increment to retry",
+                connection,
+            )
+        else:
+            if hint_mq is not None and done_mq is not None:
+                self._lwd_hint_mqs[connection] = hint_mq
+                self._lwd_done_mqs[connection] = done_mq
+                lwd_logger.error("[LWD] runtime hint/done MQs wired for %s", connection)
+                return
+
+        if sender is not None and _hint_senders.get(connection) is sender:
+            if previous_sender is None:
+                _hint_senders.pop(connection, None)
+            else:
+                _hint_senders[connection] = previous_sender
+        for mq in (done_mq, hint_mq):
+            if mq is None:
+                continue
+            try:
+                mq.shutdown()
+            except Exception:
+                lwd_logger.exception(
+                    "[LWD] runtime MQ rollback cleanup failed for %s", connection
+                )
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
@@ -655,6 +919,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request_id)
+        if request_id not in getattr(self.scheduler, "requests", {}):
+            # The matching ADD may still be queued (abort won the race); guard
+            # it so the late ADD drops instead of resurrecting this generation.
+            ledger.retire_pending_add(request_id, notify.prefix_nonce)
         ledger.retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
             "[LWD][cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
@@ -663,6 +931,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
 
     def shutdown(self) -> None:
+        self._lwd_heartbeat_stop.set()
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
@@ -683,7 +952,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             else 0
         )
 
-        def block_hasher(request: Request) -> list[bytes]:
+        def block_hasher(request: Request) -> list[BlockHash]:
             if request.num_output_tokens > 0:
                 return []
             # The cloud holds only a meta placeholder for the prompt
@@ -698,7 +967,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 and not request.block_hashes
                 and len(req_notify.block_hashes) == expected
             ):
-                return list(req_notify.block_hashes)
+                return [BlockHash(h) for h in req_notify.block_hashes]
             return []
 
         request = Request(
@@ -714,12 +983,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         )
         request.lwd_mrope_positions = req_notify.mrope_positions
+        request.lwd_image_placeholder_spans = list(req_notify.image_placeholder_spans)
         request.lwd_prefix_nonce = req_notify.prefix_nonce
-        request.lwd_prefix_probe_succeeded = req_notify.prefix_probe_succeeded
         request.lwd_wire_hashes_adopted = (
             local_hasher is not None and len(req_notify.block_hashes) == expected
         )
-        request.block_hashes = list(req_notify.block_hashes)
+        request.block_hashes = [BlockHash(h) for h in req_notify.block_hashes]
         return request
 
     @staticmethod
@@ -750,6 +1019,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_coord_wake_loop(self) -> None:
         """Move MP commands to a local queue and wake the engine thread."""
         command_queue = self.cloud_control_command_queue
+        assert command_queue is not None, (
+            "[LWD] coordination wake loop requires the control command queue"
+        )
         while True:
             try:
                 command = command_queue.get()
@@ -786,6 +1058,50 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
 
+    def _lwd_heartbeat_thread(self) -> None:
+        """Idle-safe liveness beats: an engine with no traffic never steps,
+        so the step loop cannot carry the heartbeat — a silent-but-alive
+        idle cloud would then read as dead on the edge's first step and
+        get its healthy links torn down. This thread only touches the
+        input queue (the control sender is bound to the engine thread):
+        one tick per hello interval wakes the loop and the engine thread
+        sends the beat."""
+        while not self._lwd_heartbeat_stop.wait(self._lwd_hello_interval_s):
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.WAKEUP, _LWD_HEARTBEAT_TICK)
+            )
+
+    def _lwd_send_heartbeat_if_due(self) -> None:
+        """Engine thread: one liveness beat per hello interval to every
+        registered edge. Dropped (not retried) on a full outbound queue:
+        the next beat covers the loss, and retrying would block the engine
+        step behind a stalled edge."""
+        now = time.monotonic()
+        if now - self._lwd_last_heartbeat_at < self._lwd_hello_interval_s:
+            return
+        self._lwd_last_heartbeat_at = now
+        live: list[LwdPeer] = []
+        for peer in self._lwd_edges:
+            try:
+                self._lwd_send(peer, LwdCloudHeartbeat(self._lwd_boot_id))
+                live.append(peer)
+            except LwdPeerNotRegisteredError:
+                # A liveness probe must never kill the prober: the edge's
+                # ROUTER is gone (plane already unregistered it and drops
+                # its payloads). Stop probing it; re-registration re-adds
+                # it to _lwd_edges and the beats resume.
+                lwd_logger.error(
+                    "[LWD][cloud] edge %s unreachable; heartbeat paused until "
+                    "it re-registers",
+                    peer,
+                )
+        self._lwd_edges = set(live)
+        lwd_logger.debug(
+            "[LWD][cloud] heartbeat sent boot_id=%s edges=%d",
+            self._lwd_boot_id,
+            len(self._lwd_edges),
+        )
+
     def step(self):
         """Same for the synchronous step path: drain the watermark at
         the head of the step, the rest is native."""
@@ -807,11 +1123,13 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             records.items()
         ):
             cached_tokens = self._lwd_ledger.prefix_hits.get(request_id, 0)
-            usage = LwdUsage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cached_tokens=cached_tokens,
-            )
+            usage = None
+            if completion_tokens is not None:
+                usage = LwdUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                )
             if event_queue is not None:
                 event_queue.put(
                     {
@@ -859,6 +1177,26 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     and item[0] == "refill_done"
                 ):
                     self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
+                    continue
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 4
+                    and item[1] == "link_error"
+                ):
+                    if item[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv error on "
+                            f"{connection}: {item!r}"
+                        )
+                    lwd_logger.error(
+                        "[LWD][pre-recv] link error on %s at seqno=%s: %s "
+                        "(transient: retiring its requests, connection NOT "
+                        "failed)",
+                        connection,
+                        item[2],
+                        item[3],
+                    )
+                    self._lwd_retire_connection_requests(connection)
                     continue
                 if isinstance(item, tuple) and len(item) == 4 and item[1] == "error":
                     if item[0] != connection:
@@ -916,12 +1254,26 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             seqno,
             error,
         )
+        self._lwd_retire_connection_requests(connection)
+
+    def _lwd_retire_connection_requests(self, connection: LwdConnectionId) -> None:
+        """Abort every request routed to one connection without deciding
+        whether the connection may come back: the permanent failed marking
+        stays with the caller (a link error retires its in-flight requests
+        but leaves the connection recoverable)."""
+        ledger = self._lwd_ledger
         request_ids = [
             request_id
             for request_id, peer in ledger.request_routes.items()
             if self._lwd_connection_of(peer) == connection
         ]
         for request_id in request_ids:
+            if request_id not in getattr(self.scheduler, "requests", {}):
+                # Same abort-before-ADD race as a plain abort: guard the
+                # queued ADD so it drops instead of resurrecting the request.
+                ledger.retire_pending_add(
+                    request_id, ledger.request_nonces.get(request_id, 0)
+                )
             ledger.retire_request(request_id, preserve_prompt=True)
             self.aborts_queue.put_nowait([request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
@@ -975,7 +1327,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_engine_index,
             len(scheduler.running),
             len(scheduler.waiting),
-            len(scheduler.skipped_waiting),
+            len(scheduler.deferred_waiting),
             len(scheduler.requests),
             scheduler.current_step,
             block_pool.get_usage() * 100.0,
